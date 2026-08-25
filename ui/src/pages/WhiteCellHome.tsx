@@ -1,0 +1,1351 @@
+"use client";
+
+import React, { useMemo, useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import * as SubframeCore from "@subframe/core";
+import { Badge } from "../subframe/components/Badge";
+import { Button } from "../subframe/components/Button";
+import { IconButton } from "../subframe/components/IconButton";
+import { Loader } from "../subframe/components/Loader";
+import { Table } from "../subframe/components/Table";
+import { TextField } from "../subframe/components/TextField";
+import { DefaultPageLayout } from "../subframe/layouts/DefaultPageLayout";
+import { DialogLayout } from "../subframe/layouts/DialogLayout";
+import useProductChains, { ChainView } from "../lib/useProductChains";
+import { logAnalystEvent } from "../lib/analystEvent";
+import ProductTypeList, { railFilterKey } from "../components/ProductTypeList";
+import CreateProduct from "../components/CreateProduct";
+import DeleteProductModal from "../components/DeleteProductModal";
+import { useAppContext } from "../lib/contextLib";
+
+type StatusFilter = "all" | "final" | "draft";
+
+// Filter/search persistence across remounts. Clicking a table row
+// unmounts this page (React Router swaps in the doc editor); the back
+// button remounts it fresh, which would wipe plain useState. Holding the
+// last filter at module scope lets the remounted page re-seed itself, so
+// the analyst's filter + search survive the round-trip. Resets on a full
+// page reload — which is fine; the reported bug is navigate-away-and-back.
+const lastFilters: {
+  filterKey: string | null;
+  statusFilter: StatusFilter;
+  search: string;
+  mineOnly: boolean;
+} = { filterKey: null, statusFilter: "all", search: "", mineOnly: false };
+
+// Product types (the rail) are static — there are no custom products, so
+// the /api/product_types list doesn't change between visits. Cache it at
+// module scope so navigating away and back seeds the rail instantly
+// instead of re-pulling the same list every mount. Stale-while-revalidate:
+// we still refetch in the background to stay correct.
+let cachedProductTypes: any[] | null = null;
+
+// The "When" timestamp is split across two columns — a Date cell and a Time
+// cell — both driven by whenOf(c) and sorted by the same value.
+function dateOf(ts: number): string {
+  if (!ts) return "—";
+  return new Date(ts).toLocaleDateString();
+}
+
+function timeOf(ts: number): string {
+  if (!ts) return "—";
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+// The timestamp shown in (and sorted by) the "When" column. Completion time
+// when the chain finished, else the most recent start. Defined for completed,
+// running, AND failed rows so every row has a sortable, displayable "when".
+function whenOf(c: ChainView): number {
+  return c.ended_at_ms || c.latest_started_at_ms || c.started_at_ms || 0;
+}
+
+/** Short artifact-id suffix used to disambiguate same-type rows (e.g. the
+ *  ~40 KLIEGLIGHTs). The id encodes a DTG like "INTSUM_20260529T153814Z";
+ *  strip the type prefix and show the timestamp portion. */
+function artifactSuffix(artifactId: string | null, _productType: string): string {
+  if (!artifactId) return "";
+  // The artifact_id encodes "<TypeName>_<YYYYMMDDTHHMMSS>[_<NNN>]Z". The type
+  // prefix can be either a short code ("INTSUM_20260604T081516_137Z") or a
+  // long name with spaces converted to underscores
+  // ("Operational_Environment_Definition_20260529T230647Z" — note that the
+  // product_type for these records is space-separated, e.g.
+  // "Operational Environment Definition", so a naive startsWith check on
+  // product_type+"_" fails and the whole underscored title leaks into the
+  // analyst-facing Name cell). Match the timestamp tail directly so the strip
+  // is independent of whether the prefix matches product_type exactly.
+  const match = artifactId.match(/(\d{8}T\d{6}(?:_\d{3})?Z)$/);
+  return match ? match[1] : artifactId;
+}
+
+/** The userId (== email, see /api/auth) that STARTED this chain. Stamped at
+ *  creation into source_metadata.by by every analyst-initiated fire (manual
+ *  generate, refire-downstream, retry). Empty for the startup-populated
+ *  autodraft pool, which has no human initiator. */
+function startedByOf(c: ChainView): string {
+  const raw =
+    c.source_metadata && typeof c.source_metadata === "object"
+      ? (c.source_metadata as Record<string, unknown>).by
+      : "";
+  return typeof raw === "string" ? raw : "";
+}
+
+/** "Started by" column cell. "You" for the current analyst, the starter's
+ *  email local-part (full email on hover) for everyone else, and a muted
+ *  "system" for the startup autodraft pool. Centralizes the who-fired-this
+ *  attribution so running / failed / completed rows render it identically. */
+function StartedByCell({
+  by,
+  currentUserId,
+}: {
+  by: string;
+  currentUserId?: string;
+}) {
+  if (!by) {
+    return (
+      <span
+        className="text-body font-body text-subtext-color"
+        title="Generated by the system at startup (no analyst initiator)"
+      >
+        system
+      </span>
+    );
+  }
+  const mine = !!currentUserId && by === currentUserId;
+  const display = mine ? "You" : by.includes("@") ? by.split("@")[0] : by;
+  return (
+    <span
+      className="text-body font-body text-default-font truncate max-w-[160px]"
+      title={by}
+    >
+      {display}
+    </span>
+  );
+}
+
+interface ChipProps {
+  selected: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}
+
+function Chip({ selected, onClick, children }: ChipProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={SubframeCore.twClassNames(
+        "h-8 rounded-full px-3 text-body font-body transition-colors cursor-pointer",
+        selected
+          ? "bg-brand-600 text-white"
+          : "text-default-font hover:bg-neutral-50",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function WhiteCellHome() {
+  const nav = useNavigate();
+  const { user } = useAppContext();
+
+  // Seeded from the module cache so the rail renders instantly on a
+  // navigate-back; loader only shows on the first-ever load.
+  const [productTypes, setProductTypes] = useState<any[]>(
+    () => cachedProductTypes ?? [],
+  );
+  const [loadingTypes, setLoadingTypes] = useState(cachedProductTypes === null);
+
+  // Rail filter — single-select product type. null = show everything.
+  const [filterKey, setFilterKey] = useState<string | null>(
+    () => lastFilters.filterKey,
+  );
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(
+    () => lastFilters.statusFilter,
+  );
+  const [search, setSearch] = useState(() => lastFilters.search);
+  // "Mine only" — scope the list to chains this analyst started (matched on
+  // source_metadata.by == userId, see startedByOf). Off by default so the
+  // shared catalog is the landing view; persisted like the other filters.
+  const [mineOnly, setMineOnly] = useState(() => lastFilters.mineOnly);
+  // "When" column sort direction. Newest-first by default; the column header
+  // toggles it.
+  const [whenSortDir, setWhenSortDir] = useState<"desc" | "asc">("desc");
+
+  // Write-through: mirror filter state into the module cache on change so
+  // it outlives the unmount when a row opens the doc editor.
+  useEffect(() => {
+    lastFilters.filterKey = filterKey;
+    lastFilters.statusFilter = statusFilter;
+    lastFilters.search = search;
+    lastFilters.mineOnly = mineOnly;
+  }, [filterKey, statusFilter, search, mineOnly]);
+
+  // Custom product-type management (rail overflow + footer).
+  const [openCreateProduct, setOpenCreateProduct] = useState(false);
+  const [editProductType, setEditProductType] = useState<any>(null);
+  const [deleteTarget, setDeleteTarget] = useState<any>(null);
+  const [deleting, setDeleting] = useState(false);
+  // Per-row chain delete confirm modal.
+  const [deleteRowTarget, setDeleteRowTarget] = useState<ChainView | null>(null);
+  const [deletingRow, setDeletingRow] = useState(false);
+  const [deleteRowError, setDeleteRowError] = useState<string | null>(null);
+  // Soft de-dup: when the analyst hits Generate on a product already in
+  // flight, confirm before firing a second copy.
+  const [confirmGen, setConfirmGen] = useState<{ type: string; by: string } | null>(
+    null,
+  );
+
+  // Unified jobs registry — single source of truth for both the
+  // in-flight placeholder rows and the completed-artifact catalog
+  // rows. WebSocket-driven (no polling).
+  const {
+    chains,
+    loading: loadingChains,
+    error: chainsError,
+    refresh: refreshChains,
+    cancel: cancelRecord,
+    retry: retryChain,
+    delete: deleteChain,
+  } = useProductChains();
+
+  useEffect(() => {
+    loadProductTypes();
+  }, []);
+
+  // Keep the module cache in sync with any in-place edits/deletes of
+  // product types (guard length so the initial empty state never clobbers
+  // a populated cache).
+  useEffect(() => {
+    if (productTypes.length) cachedProductTypes = productTypes;
+  }, [productTypes]);
+
+  async function loadProductTypes() {
+    if (cachedProductTypes === null) setLoadingTypes(true);
+    try {
+      const r = await fetch("/api/product_types");
+      if (r.ok) {
+        const data = await r.json();
+        const arr = Array.isArray(data) ? data : [];
+        cachedProductTypes = arr;
+        setProductTypes(arr);
+      }
+    } catch (e) {
+      console.error("Failed to fetch product types:", e);
+    } finally {
+      setLoadingTypes(false);
+    }
+  }
+
+  function handleNewProductType(updated: any) {
+    setProductTypes((prev) => {
+      const idx = prev.findIndex(
+        (p) => p.productTypeId === updated.productTypeId,
+      );
+      if (idx >= 0) {
+        const next = prev.slice();
+        next[idx] = updated;
+        return next;
+      }
+      return [...prev, updated];
+    });
+    setEditProductType(null);
+  }
+
+  function handleDeleteProductType(deletedId: string) {
+    setProductTypes((prev) =>
+      prev.filter((p) => p.productTypeId !== deletedId),
+    );
+    setEditProductType(null);
+  }
+
+  function handleRailFilter(pt: any) {
+    const key = railFilterKey(pt);
+    const next = filterKey === key ? null : key;
+    logAnalystEvent({
+      event_type: "dashboard.filter",
+      surface: "dashboard",
+      product_type: next,
+      user_id: user?.userId ?? null,
+      detail: { from: filterKey, to: next },
+    });
+    setFilterKey(next);
+  }
+
+  function handleRailViewTemplate(pt: any) {
+    if (!pt.file?.key) return;
+    window.open("/files/" + pt.file.key, "_blank");
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget?.productTypeId) return;
+    setDeleting(true);
+    try {
+      await fetch(
+        `/api/product_types/${deleteTarget.productTypeId}?user_id=${deleteTarget.userId}`,
+        { method: "DELETE" },
+      );
+      handleDeleteProductType(deleteTarget.productTypeId);
+    } catch (e) {
+      console.error("Error deleting product type:", e);
+    } finally {
+      setDeleting(false);
+      setDeleteTarget(null);
+    }
+  }
+
+  // Running rows = chains still generating; these are the only placeholders
+  // pinned at the top of the table. Failed rows are NOT pinned — they sort
+  // into the catalog body alongside completed rows (see bodyChains below).
+  const runningChains = useMemo(
+    () => chains.filter((c) => c.state === "running"),
+    [chains],
+  );
+  const completeChains = useMemo(() => {
+    const complete = chains.filter((c) => c.state === "complete");
+    // Collapse any two completed chains that resolve to the SAME artifact
+    // into a single row, preferring the clickable (has session) and most
+    // recent one. This is the visible guarantee against the "same product
+    // shows twice, one clickable one not" case — even if a stray non-
+    // clickable twin slips into the registry, the analyst only ever sees
+    // the openable row. Rows with no artifact_id can't be matched this way,
+    // so they pass through untouched (distinct artifacts are never merged —
+    // each has its own artifact_id).
+    const byArtifact = new Map<string, ChainView>();
+    const passthrough: ChainView[] = [];
+    for (const c of complete) {
+      if (!c.artifact_id) {
+        passthrough.push(c);
+        continue;
+      }
+      const prev = byArtifact.get(c.artifact_id);
+      if (!prev) {
+        byArtifact.set(c.artifact_id, c);
+        continue;
+      }
+      const prevClickable = !!prev.autodraft_session_id;
+      const curClickable = !!c.autodraft_session_id;
+      let winner: ChainView;
+      if (prevClickable !== curClickable) {
+        winner = curClickable ? c : prev;
+      } else {
+        winner = whenOf(c) >= whenOf(prev) ? c : prev;
+      }
+      byArtifact.set(c.artifact_id, winner);
+    }
+    return [...byArtifact.values(), ...passthrough];
+  }, [chains]);
+
+  // The catalog body = completed rows plus failed rows. Failed gens are no
+  // longer pinned at the top; they sort into the list by the same "When"
+  // value as everything else (see the filtered memo).
+  const bodyChains = useMemo(
+    () => [...completeChains, ...chains.filter((c) => c.state === "failed")],
+    [completeChains, chains],
+  );
+
+  // Product types currently generating (any analyst) — drives soft de-dup.
+  const runningTypes = useMemo(
+    () => new Set(runningChains.map((c) => c.product_type)),
+    [runningChains],
+  );
+
+  // Soft de-dup: analyst hits Generate on a product already in flight.
+  function handleGenerate() {
+    if (!filterKey) return;
+    // Defense-in-depth: map-driven products (per-target header_only +
+    // KLIEGLIGHT / OSIR autofire-only paragraph reports) are initiated
+    // from the operations map (right-click for targeting, autofire for
+    // SIGINT / OSINT), never from the dashboard. The button itself is
+    // suppressed above, but a stray keyboard activation must not POST
+    // without a target / signal binding.
+    if (filterIsMapDriven) return;
+    if (runningTypes.has(filterKey)) {
+      const who =
+        (runningChains.find((c) => c.product_type === filterKey)
+          ?.source_metadata as Record<string, unknown> | undefined)?.by;
+      setConfirmGen({
+        type: filterKey,
+        by: typeof who === "string" ? who : "",
+      });
+      return;
+    }
+    void doGenerate(filterKey);
+  }
+
+  async function doGenerate(type: string, configOverride?: Record<string, unknown>) {
+    logAnalystEvent({
+      event_type: "dashboard.generate",
+      surface: "dashboard",
+      product_type: type,
+      user_id: user?.userId ?? null,
+    });
+    try {
+      const qs = new URLSearchParams({ product_type: type });
+      if (user?.userId) qs.set("by", user.userId);
+      // Schema-driven analyst config — if the gear button captured any
+      // values (or the per-type cache has them from a previous open),
+      // send as JSON so the backend can parse + apply per-request
+      // overrides (e.g. HVT_WORTHY_CATEGORIES for HVTL).
+      const cfg = configOverride ?? configByType[type];
+      if (cfg && Object.keys(cfg).length > 0) {
+        qs.set("config_json", JSON.stringify(cfg));
+      }
+      const r = await fetch(`/api/products/generate?${qs.toString()}`, {
+        method: "POST",
+      });
+      if (!r.ok) {
+        console.error("generate failed:", await r.text());
+        return;
+      }
+      // No poll — register_and_run broadcasts product_record_upsert
+      // immediately, so the row paints within ms.
+    } catch (e) {
+      console.error("generate error:", e);
+    }
+  }
+
+  // ── Schema-driven analyst config (gear button next to Generate) ────
+  //
+  // Each product schema can declare a top-level `config_fields` block.
+  // Today only HVTL ships one (hvt_worthy_categories). When the analyst
+  // clicks the gear, we fetch the schema's config_fields, seed any
+  // saved values from configByType, and render a modal. On submit the
+  // values land in configByType[type] + flow into doGenerate's
+  // config_json.
+  type ConfigField = {
+    type: "multi_select" | "single_select" | "boolean" | "text";
+    render_label?: string;
+    description?: string;
+    options?: { value: string; label: string }[];
+    default?: unknown;
+  };
+  type ConfigFieldsDoc = {
+    product_type: string;
+    config_fields: Record<string, ConfigField>;
+    current_values?: Record<string, unknown>;
+  };
+  const [configByType, setConfigByType] = useState<Record<string, Record<string, unknown>>>({});
+  const [configModal, setConfigModal] = useState<
+    | { product_type: string; fields: Record<string, ConfigField>; values: Record<string, unknown> }
+    | null
+  >(null);
+
+  async function openConfigModal(type: string) {
+    try {
+      const r = await fetch(`/api/products/config_fields/${encodeURIComponent(type)}`);
+      if (!r.ok) {
+        console.error("config_fields fetch failed:", await r.text());
+        return;
+      }
+      const body = (await r.json()) as ConfigFieldsDoc;
+      const fields = body.config_fields || {};
+      if (Object.keys(fields).length === 0) {
+        // No configurable knobs — close gear silently.
+        return;
+      }
+      const saved = configByType[type] || {};
+      const values: Record<string, unknown> = {};
+      for (const [k, spec] of Object.entries(fields)) {
+        values[k] = k in saved ? saved[k] : (spec.default as unknown);
+      }
+      setConfigModal({ product_type: type, fields, values });
+    } catch (e) {
+      console.error("config modal open error:", e);
+    }
+  }
+
+  function saveConfigModal() {
+    if (!configModal) return;
+    setConfigByType((prev) => ({
+      ...prev,
+      [configModal.product_type]: configModal.values,
+    }));
+    setConfigModal(null);
+  }
+
+  // Friendly label for the active filter pill.
+  const filterLabel = useMemo(() => {
+    if (!filterKey) return null;
+    const pt = productTypes.find((p) => railFilterKey(p) === filterKey);
+    return pt?.productLongName || pt?.productName || filterKey;
+  }, [filterKey, productTypes]);
+
+  // Map-driven products are generated from the operations map, not from
+  // the dashboard Generate button. Two flavors:
+  //   - per-target (shape === "header_only"): right-click a hostile
+  //     mil_unit and the per-target chain fires for THAT target
+  //     (TIDAT, TMP, CDE, BDA-stub, CA-stub).
+  //   - autofire-only SIGINT/OSINT (KLIEGLIGHT, OSIR): fires every time
+  //     the recent-intel poller surfaces a perishable signal matching
+  //     the live HVTL. No analyst inputs — manual generation produces
+  //     an empty artifact, so the button is suppressed.
+  // Shape + productName are both surfaced by /api/product_types
+  // (_intel_agent_builtins in routers/api/product_types.py).
+  const filterIsMapDriven = useMemo(() => {
+    if (!filterKey) return false;
+    const pt = productTypes.find((p) => railFilterKey(p) === filterKey);
+    if (!pt) return false;
+    if (pt.shape === "header_only") return true;
+    if (pt.productName === "KLIEGLIGHT" || pt.productName === "OSIR") return true;
+    return false;
+  }, [filterKey, productTypes]);
+
+  // Long display name for a product type (used by generating placeholders).
+  function longNameForType(type: string): string {
+    const pt = productTypes.find((p) => railFilterKey(p) === type);
+    return pt?.productLongName || pt?.productName || type;
+  }
+
+  // Filter + sort over completed chains. Sorted by the SAME value the "When"
+  // column renders (whenOf) so the visible order matches that column, in the
+  // header-selected direction.
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const uid = user?.userId;
+    const rows = bodyChains.filter((c) => {
+      if (filterKey && c.product_type !== filterKey) return false;
+      if (mineOnly && uid && startedByOf(c) !== uid) return false;
+      // Failed gens belong to the sorted list but are neither final nor a
+      // draft — only surface them in the unfiltered ("all") view.
+      const failed = c.state === "failed";
+      if (statusFilter === "final" && (failed || c.approval_status !== "published"))
+        return false;
+      if (statusFilter === "draft" && (failed || c.approval_status === "published"))
+        return false;
+      if (q) {
+        const hay = `${c.product_type} ${c.long_name}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    rows.sort((a, b) =>
+      whenSortDir === "desc" ? whenOf(b) - whenOf(a) : whenOf(a) - whenOf(b),
+    );
+    return rows;
+  }, [bodyChains, filterKey, statusFilter, search, mineOnly, user?.userId, whenSortDir]);
+
+  // Telemetry: a settled search that returns nothing = a product the analyst
+  // wanted and we don't have. Debounced so we log the settled query, not every
+  // keystroke. Fire-and-forget.
+  useEffect(() => {
+    const q = search.trim();
+    if (!q) return;
+    const t = setTimeout(() => {
+      logAnalystEvent({
+        event_type: "dashboard.search",
+        surface: "dashboard",
+        user_id: user?.userId ?? null,
+        value_num: filtered.length,
+        detail: {
+          query: q,
+          result_count: filtered.length,
+          zero_result: filtered.length === 0,
+        },
+      });
+    }, 800);
+    return () => clearTimeout(t);
+  }, [search, filtered, user]);
+
+  // Running placeholder rows after the same filter the render uses — so the
+  // empty-state message is accurate per filter. These are pinned at the top.
+  const visibleRunning = useMemo(() => {
+    const uid = user?.userId;
+    const rows = runningChains.filter((c) => {
+      if (filterKey && c.product_type !== filterKey) return false;
+      if (mineOnly && uid && startedByOf(c) !== uid) return false;
+      return statusFilter === "all" || statusFilter === "draft";
+    });
+    rows.sort((a, b) =>
+      whenSortDir === "desc" ? whenOf(b) - whenOf(a) : whenOf(a) - whenOf(b),
+    );
+    return rows;
+  }, [runningChains, filterKey, statusFilter, mineOnly, user?.userId, whenSortDir]);
+
+  function openRow(c: ChainView) {
+    if (!c.autodraft_session_id) return;
+    // Pass pending_product_type so DocEditorPage boot can resolve the
+    // artifact via the autodraft cache even when SessionDetail hasn't
+    // fully flushed. pending_format mounts the right surface
+    // (LiveEditor for xlsx, etc.) on first paint.
+    const params = new URLSearchParams({
+      pending_product_type: c.product_type,
+      pending_format: c.format || "",
+      // Opening an existing product, not generating a new one — flips the
+      // editor's load placeholder copy from "Generating…" to "Opening…".
+      opening: "1",
+    });
+    nav(
+      `/missioncommand/docs/${encodeURIComponent(c.autodraft_session_id)}?${params.toString()}`,
+    );
+  }
+
+  // Per-row delete opens a confirm modal; the actual DELETE runs on confirm.
+  // Both terminal states (complete + failed) are deletable; a running gen
+  // must be cancelled first, so it has no delete button and is guarded here.
+  function handleDeleteRow(c: ChainView) {
+    if (c.state === "running") return;
+    setDeleteRowError(null);
+    setDeleteRowTarget(c);
+  }
+
+  async function confirmDeleteRow() {
+    const c = deleteRowTarget;
+    if (!c?.latest_record_id) return;
+    setDeletingRow(true);
+    setDeleteRowError(null);
+    try {
+      await deleteChain(c.latest_record_id);
+      // Close only on success — on failure we keep the modal open and
+      // surface the error rather than silently dismissing it.
+      setDeleteRowTarget(null);
+    } catch (e) {
+      console.error("delete error:", e);
+      setDeleteRowError(
+        e instanceof Error ? e.message : "Delete failed. Please try again.",
+      );
+    } finally {
+      setDeletingRow(false);
+    }
+  }
+
+  function StatusBadge({ chain }: { chain: ChainView }) {
+    if (chain.state === "failed") return <Badge variant="error">GEN FAILED</Badge>;
+    if (chain.state === "running")
+      return <Badge variant="warning">RUNNING</Badge>;
+    if (chain.approval_status === "published") {
+      const who = chain.approved_by
+        ? `Approved by ${chain.approved_by}${
+            chain.approved_at
+              ? ` · ${new Date(chain.approved_at).toLocaleString()}`
+              : ""
+          }`
+        : "Final";
+      return (
+        <Badge variant="success" title={who}>
+          FINAL
+        </Badge>
+      );
+    }
+    return <Badge variant="warning">DRAFT</Badge>;
+  }
+
+  // Header count = categorized, non-Doctrine product types (what the rail
+  // renders). The catalog can have many more rows than this (per-artifact).
+  const railTypeCount = useMemo(
+    () =>
+      productTypes.filter(
+        (pt) => pt.productName !== "Doctrines" && pt.category,
+      ).length,
+    [productTypes],
+  );
+
+  return (
+    <DefaultPageLayout>
+      <div className="flex w-full flex-1 min-h-0 items-stretch overflow-hidden">
+        {/* Left rail: product-type filter */}
+        <aside className="flex w-80 min-h-0 flex-none flex-col border-r border-solid border-neutral-border bg-default-background">
+          <div className="flex w-full items-start justify-between px-4 pt-4 pb-2">
+            <div className="flex flex-col items-start">
+              <div className="flex items-center gap-2">
+                <span className="text-heading-3 font-heading-3 text-default-font">
+                  Product Types
+                </span>
+                <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-caption font-caption text-subtext-color">
+                  {railTypeCount}
+                </span>
+              </div>
+              <span className="text-caption font-caption text-subtext-color">
+                Click a product to filter the catalog
+              </span>
+            </div>
+          </div>
+
+          <div className="flex w-full grow shrink-0 basis-0 min-h-0 flex-col items-start gap-1 overflow-y-auto px-2 py-2">
+            {loadingTypes ? (
+              <div className="flex w-full items-center justify-center py-8">
+                <Loader size="medium" />
+              </div>
+            ) : (
+              <ProductTypeList
+                productTypes={productTypes}
+                selectedKey={filterKey}
+                onRailFilter={handleRailFilter}
+                onRailEdit={(pt: any) => {
+                  setEditProductType(pt);
+                  setOpenCreateProduct(true);
+                }}
+                onRailDelete={(pt: any) => setDeleteTarget(pt)}
+                onRailViewTemplate={handleRailViewTemplate}
+              />
+            )}
+          </div>
+        </aside>
+
+        {/* Main column — bounded, non-scrolling; the table container
+            below is the scroll area so the filters + header stay pinned. */}
+        <main className="flex flex-1 min-w-0 min-h-0 flex-col items-start gap-4 px-6 py-6 overflow-hidden">
+          {/* Filter row */}
+          <div className="flex w-full flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1.5">
+              <span className="text-caption font-caption uppercase tracking-wider text-subtext-color">
+                Status
+              </span>
+              <Chip
+                selected={statusFilter === "final"}
+                onClick={() =>
+                  setStatusFilter(statusFilter === "final" ? "all" : "final")
+                }
+              >
+                Final
+              </Chip>
+              <Chip
+                selected={statusFilter === "draft"}
+                onClick={() =>
+                  setStatusFilter(statusFilter === "draft" ? "all" : "draft")
+                }
+              >
+                Drafts
+              </Chip>
+            </div>
+
+            {/* Creator scope — "Mine" narrows every row (running, draft,
+                final, failed) to the chains this analyst started. Hidden when
+                there's no signed-in user since the filter would be a no-op. */}
+            {user?.userId && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-caption font-caption uppercase tracking-wider text-subtext-color">
+                  Creator
+                </span>
+                <Chip
+                  selected={mineOnly}
+                  onClick={() => setMineOnly((v) => !v)}
+                >
+                  <span className="inline-flex items-center gap-1">
+                    <SubframeCore.Icon name="FeatherUser" />
+                    Mine
+                  </span>
+                </Chip>
+              </div>
+            )}
+
+            <div className="flex-1 min-w-[200px] ml-auto">
+              <TextField
+                className="w-full"
+                icon="FeatherSearch"
+                label=""
+                helpText=""
+              >
+                <TextField.Input
+                  placeholder="Search the library..."
+                  value={search}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    setSearch(e.target.value)
+                  }
+                />
+              </TextField>
+            </div>
+          </div>
+
+          {/* Active rail filter — visible affordance + one-click clear. */}
+          {filterLabel && (
+            <div className="flex items-center gap-2">
+              <span className="text-caption font-caption text-subtext-color">
+                Filtered by
+              </span>
+              <button
+                type="button"
+                onClick={() => setFilterKey(null)}
+                className="flex items-center gap-1.5 rounded-full border border-solid border-brand-200 bg-brand-50 px-2.5 py-1 text-caption font-caption-bold text-brand-700 hover:bg-brand-100"
+              >
+                {filterLabel}
+                <SubframeCore.Icon name="FeatherX" />
+              </button>
+            </div>
+          )}
+
+          {/* Header row over the table */}
+          <div className="flex w-full items-baseline justify-between">
+            <div className="flex items-baseline gap-2">
+              <span className="text-heading-2 font-heading-2 text-default-font">
+                Products
+              </span>
+              <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-caption font-caption text-subtext-color">
+                {loadingChains ? "…" : filtered.length}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {/* Generate the currently-selected product (rail filter).
+                  Map-driven products are excluded — per-target (header_only)
+                  fire from a map right-click; KLIEGLIGHT / OSIR fire from
+                  the recent-intel autofire loop. Manual generation for any
+                  of those is empty/broken, so the button is suppressed. */}
+              {filterKey && !filterIsMapDriven && (
+                <Button
+                  size="small"
+                  variant="brand-primary"
+                  onClick={handleGenerate}
+                  title={`Generate a new ${filterLabel}`}
+                >
+                  Generate New {filterLabel}
+                </Button>
+              )}
+              {/* Schema-driven analyst config — gear icon next to the
+                  Generate button. Opens a modal of the schema's
+                  config_fields when the product declares any
+                  (today: HVTL.hvt_worthy_categories). Silently no-ops
+                  for products with no config_fields. */}
+              {filterKey && !filterIsMapDriven && (
+                <IconButton
+                  size="small"
+                  icon="FeatherSettings"
+                  onClick={() => void openConfigModal(filterKey)}
+                  aria-label="Configure generation"
+                  title={`Configure ${filterLabel} generation`}
+                />
+              )}
+              <IconButton
+                size="small"
+                icon="FeatherRefreshCw"
+                onClick={refreshChains}
+                aria-label="Refresh"
+              />
+            </div>
+          </div>
+
+          {/* Analyst config modal — one section per config_fields entry. */}
+          {configModal && (
+            <div
+              style={{
+                position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                zIndex: 1000,
+              }}
+              onClick={() => setConfigModal(null)}
+            >
+              <div
+                style={{
+                  background: "#16213e", color: "#e5e7eb",
+                  padding: 24, borderRadius: 10, minWidth: 480,
+                  maxWidth: 720, maxHeight: "85vh", overflow: "auto",
+                  border: "1px solid #0f3460",
+                }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div style={{ fontSize: "1.1rem", fontWeight: 700, marginBottom: 18 }}>
+                  Configure {configModal.product_type} generation
+                </div>
+                {Object.entries(configModal.fields).map(([key, spec]) => (
+                  <div key={key} style={{ marginBottom: 18 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                      {spec.render_label || key}
+                    </div>
+                    {spec.type === "multi_select" && Array.isArray(spec.options) && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {spec.options.map((opt) => {
+                          const selected = Array.isArray(configModal.values[key])
+                            ? ((configModal.values[key] as string[]).includes(opt.value))
+                            : false;
+                          return (
+                            <label key={opt.value} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                              <input
+                                type="checkbox"
+                                checked={selected}
+                                onChange={(e) => {
+                                  const prev = Array.isArray(configModal.values[key])
+                                    ? (configModal.values[key] as string[])
+                                    : [];
+                                  const next = e.target.checked
+                                    ? [...prev, opt.value]
+                                    : prev.filter((v) => v !== opt.value);
+                                  setConfigModal({
+                                    ...configModal,
+                                    values: { ...configModal.values, [key]: next },
+                                  });
+                                }}
+                              />
+                              <span>{opt.label}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+                  <Button size="small" variant="neutral-secondary" onClick={() => setConfigModal(null)}>
+                    Cancel
+                  </Button>
+                  <Button size="small" variant="brand-primary" onClick={saveConfigModal}>
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {chainsError && (
+            <div className="flex w-full items-center gap-2 rounded-md border border-solid border-error-300 bg-error-50 px-3 py-2">
+              <SubframeCore.Icon
+                className="text-body font-body text-error-700"
+                name="FeatherAlertCircle"
+              />
+              <span className="text-caption font-caption text-error-700 flex-1">
+                {chainsError}
+              </span>
+            </div>
+          )}
+
+          {/* Table — flex-1 + min-h-0 so it fills the remaining height
+              and scrolls internally. scrollbar-gutter: stable so the
+              vertical scrollbar doesn't sit on top of the action icons. */}
+          <div
+            className="w-full flex-1 min-h-0 overflow-y-auto rounded-md border border-solid border-neutral-border"
+            style={{ scrollbarGutter: "stable" }}
+          >
+            <Table
+              header={
+                <Table.HeaderRow>
+                  <Table.HeaderCell>Type</Table.HeaderCell>
+                  <Table.HeaderCell>Name</Table.HeaderCell>
+                  <Table.HeaderCell
+                    className="cursor-pointer select-none"
+                    title="Sort by time"
+                    onClick={() =>
+                      setWhenSortDir((d) => (d === "desc" ? "asc" : "desc"))
+                    }
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      Date
+                      <SubframeCore.Icon
+                        name={
+                          whenSortDir === "desc"
+                            ? "FeatherChevronDown"
+                            : "FeatherChevronUp"
+                        }
+                      />
+                    </span>
+                  </Table.HeaderCell>
+                  <Table.HeaderCell
+                    className="cursor-pointer select-none"
+                    title="Sort by time"
+                    onClick={() =>
+                      setWhenSortDir((d) => (d === "desc" ? "asc" : "desc"))
+                    }
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      Time
+                      <SubframeCore.Icon
+                        name={
+                          whenSortDir === "desc"
+                            ? "FeatherChevronDown"
+                            : "FeatherChevronUp"
+                        }
+                      />
+                    </span>
+                  </Table.HeaderCell>
+                  <Table.HeaderCell>Started by</Table.HeaderCell>
+                  <Table.HeaderCell>Status</Table.HeaderCell>
+                  <Table.HeaderCell />
+                </Table.HeaderRow>
+              }
+            >
+              {loadingChains && chains.length === 0 ? (
+                <Table.Row>
+                  <Table.Cell>
+                    <div className="flex w-full items-center justify-center py-8">
+                      <Loader size="medium" />
+                    </div>
+                  </Table.Cell>
+                  <Table.Cell />
+                  <Table.Cell />
+                  <Table.Cell />
+                  <Table.Cell />
+                  <Table.Cell />
+                  <Table.Cell />
+                </Table.Row>
+              ) : (
+                <>
+                  {/* Running chains pinned at the top — each shows a live
+                      spinner and a Cancel icon. Filtered out under "Final"
+                      since an in-progress gen isn't final. (Failed gens are
+                      NOT pinned — they sort into the body list below.) */}
+                  {visibleRunning.map((c) => {
+                    return (
+                      <Table.Row key={c.chain_head_id} className="bg-neutral-50">
+                        <Table.Cell>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono uppercase tracking-wider text-caption-bold font-caption-bold text-brand-600 truncate max-w-[150px]">
+                              {c.product_type}
+                            </span>
+                            {c.format && (
+                              <span className="rounded bg-neutral-100 px-1 py-0.5 text-[10px] font-caption-bold uppercase tracking-wider text-subtext-color">
+                                {c.format}
+                              </span>
+                            )}
+                          </div>
+                        </Table.Cell>
+                        <Table.Cell>
+                          <span className="text-body-bold font-body-bold text-default-font truncate">
+                            {c.long_name || longNameForType(c.product_type)}
+                          </span>
+                        </Table.Cell>
+                        <Table.Cell>
+                          <span className="text-body font-body text-subtext-color">
+                            {dateOf(whenOf(c))}
+                          </span>
+                        </Table.Cell>
+                        <Table.Cell>
+                          <span className="text-body font-body text-subtext-color">
+                            {timeOf(whenOf(c))}
+                          </span>
+                        </Table.Cell>
+                        <Table.Cell>
+                          <StartedByCell
+                            by={startedByOf(c)}
+                            currentUserId={user?.userId}
+                          />
+                        </Table.Cell>
+                        <Table.Cell>
+                          <div className="flex items-center gap-2">
+                            <Loader size="small" />
+                            <span className="text-caption font-caption text-subtext-color">
+                              {c.progress_pct > 0
+                                ? `Generating… ${c.progress_pct}%`
+                                : "Generating…"}
+                            </span>
+                          </div>
+                        </Table.Cell>
+                        <Table.Cell className="justify-end">
+                          <div className="flex items-center justify-end gap-2 pr-3">
+                            <IconButton
+                              size="small"
+                              icon="FeatherX"
+                              title="Cancel"
+                              aria-label="Cancel"
+                              onClick={(
+                                ev: React.MouseEvent<HTMLButtonElement>,
+                              ) => {
+                                ev.stopPropagation();
+                                void cancelRecord(c.latest_record_id).catch(
+                                  (err) => console.error("cancel failed:", err),
+                                );
+                              }}
+                            />
+                          </div>
+                        </Table.Cell>
+                      </Table.Row>
+                    );
+                  })}
+
+                  {filtered.length === 0 ? (
+                    visibleRunning.length === 0 ? (
+                      <Table.Row>
+                        <Table.Cell>
+                          <span className="text-body font-body text-subtext-color px-3 py-6">
+                            {chains.length === 0
+                              ? "No products in the catalog yet — autodrafts populate at startup."
+                              : mineOnly
+                                ? "You haven't started any products yet — hit Generate, or turn off the Mine filter to see the full catalog."
+                                : "No products match the current filters."}
+                          </span>
+                        </Table.Cell>
+                        <Table.Cell />
+                        <Table.Cell />
+                        <Table.Cell />
+                        <Table.Cell />
+                        <Table.Cell />
+                        <Table.Cell />
+                      </Table.Row>
+                    ) : null
+                  ) : (
+                    filtered.map((c) => {
+                      // Failed gens sort into the body alongside completed
+                      // rows (no longer pinned at the top). They aren't
+                      // clickable; their actions are Retry + Delete.
+                      if (c.state === "failed") {
+                        return (
+                          <Table.Row key={c.chain_head_id} className="group">
+                            <Table.Cell>
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono uppercase tracking-wider text-caption-bold font-caption-bold text-brand-600 truncate max-w-[150px]">
+                                  {c.product_type || "—"}
+                                </span>
+                                {c.format && (
+                                  <span className="rounded bg-neutral-100 px-1 py-0.5 text-[10px] font-caption-bold uppercase tracking-wider text-subtext-color">
+                                    {c.format}
+                                  </span>
+                                )}
+                              </div>
+                            </Table.Cell>
+                            <Table.Cell>
+                              <div className="flex flex-col">
+                                <span className="text-body-bold font-body-bold text-default-font truncate">
+                                  {c.long_name ||
+                                    longNameForType(c.product_type)}
+                                </span>
+                                <span
+                                  className="text-caption font-caption text-error-600 truncate"
+                                  title={c.error || ""}
+                                >
+                                  Error during generation
+                                </span>
+                              </div>
+                            </Table.Cell>
+                            <Table.Cell>
+                              <span className="text-body font-body text-subtext-color">
+                                {dateOf(whenOf(c))}
+                              </span>
+                            </Table.Cell>
+                            <Table.Cell>
+                              <span className="text-body font-body text-subtext-color">
+                                {timeOf(whenOf(c))}
+                              </span>
+                            </Table.Cell>
+                            <Table.Cell>
+                              <StartedByCell
+                                by={startedByOf(c)}
+                                currentUserId={user?.userId}
+                              />
+                            </Table.Cell>
+                            <Table.Cell>
+                              <Badge variant="error">GEN FAILED</Badge>
+                            </Table.Cell>
+                            <Table.Cell className="justify-end">
+                              <div className="flex items-center justify-end gap-3 pr-3 opacity-0 transition-opacity group-hover:opacity-100">
+                                <IconButton
+                                  size="small"
+                                  icon="FeatherRefreshCw"
+                                  title="Retry"
+                                  aria-label="Retry"
+                                  onClick={(
+                                    e: React.MouseEvent<HTMLButtonElement>,
+                                  ) => {
+                                    e.stopPropagation();
+                                    logAnalystEvent({
+                                      event_type: "dashboard.retry",
+                                      surface: "dashboard",
+                                      product_type: c.product_type,
+                                      user_id: user?.userId ?? null,
+                                      detail: {
+                                        chain_head_id: c.chain_head_id,
+                                        prior_error_kind:
+                                          (c as any).error_kind ?? null,
+                                      },
+                                    });
+                                    void retryChain(
+                                      c.chain_head_id,
+                                      user?.userId,
+                                    ).catch((err) =>
+                                      console.error("retry failed:", err),
+                                    );
+                                  }}
+                                />
+                                <IconButton
+                                  variant="destructive-tertiary"
+                                  size="small"
+                                  icon="FeatherTrash2"
+                                  onClick={(
+                                    e: React.MouseEvent<HTMLButtonElement>,
+                                  ) => {
+                                    e.stopPropagation();
+                                    handleDeleteRow(c);
+                                  }}
+                                  aria-label="Delete"
+                                />
+                              </div>
+                            </Table.Cell>
+                          </Table.Row>
+                        );
+                      }
+                      const clickable = !!c.autodraft_session_id;
+                      return (
+                        <Table.Row
+                          key={c.chain_head_id}
+                          clickable={clickable}
+                          onClick={clickable ? () => openRow(c) : undefined}
+                          className="group"
+                        >
+                          <Table.Cell>
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-mono uppercase tracking-wider text-caption-bold font-caption-bold text-brand-600 truncate max-w-[150px]">
+                                {c.product_type || "—"}
+                              </span>
+                              {c.format && (
+                                <span className="rounded bg-neutral-100 px-1 py-0.5 text-[10px] font-caption-bold uppercase tracking-wider text-subtext-color">
+                                  {c.format}
+                                </span>
+                              )}
+                            </div>
+                          </Table.Cell>
+                          <Table.Cell>
+                            <div className="flex flex-col">
+                              <span className="text-body-bold font-body-bold text-default-font truncate">
+                                {c.long_name}
+                              </span>
+                              <span className="font-mono text-caption font-caption text-subtext-color truncate">
+                                {artifactSuffix(c.artifact_id, c.product_type)}
+                              </span>
+                            </div>
+                          </Table.Cell>
+                          <Table.Cell>
+                            <span className="text-body font-body text-subtext-color">
+                              {dateOf(whenOf(c))}
+                            </span>
+                          </Table.Cell>
+                          <Table.Cell>
+                            <span className="text-body font-body text-subtext-color">
+                              {timeOf(whenOf(c))}
+                            </span>
+                          </Table.Cell>
+                          <Table.Cell>
+                            <StartedByCell
+                              by={startedByOf(c)}
+                              currentUserId={user?.userId}
+                            />
+                          </Table.Cell>
+                          <Table.Cell>
+                            <StatusBadge chain={c} />
+                          </Table.Cell>
+                          <Table.Cell className="justify-end">
+                            {/* View + Delete reveal on hover. pr-3 keeps
+                                the icons clear of the vertical scrollbar. */}
+                            <div className="flex items-center justify-end gap-3 pr-3 opacity-0 transition-opacity group-hover:opacity-100">
+                              {clickable && (
+                                <IconButton
+                                  size="small"
+                                  icon="FeatherEye"
+                                  onClick={(
+                                    e: React.MouseEvent<HTMLButtonElement>,
+                                  ) => {
+                                    e.stopPropagation();
+                                    openRow(c);
+                                  }}
+                                  aria-label="Open"
+                                />
+                              )}
+                              {c.artifact_id && (
+                                <IconButton
+                                  size="small"
+                                  icon="FeatherShare2"
+                                  onClick={(
+                                    e: React.MouseEvent<HTMLButtonElement>,
+                                  ) => {
+                                    e.stopPropagation();
+                                    nav(
+                                      `/missioncommand/graph-viewer?artifact_id=${encodeURIComponent(
+                                        c.artifact_id!,
+                                      )}`,
+                                    );
+                                  }}
+                                  aria-label="View COUGAAR data"
+                                />
+                              )}
+                              <IconButton
+                                variant="destructive-tertiary"
+                                size="small"
+                                icon="FeatherTrash2"
+                                onClick={(
+                                  e: React.MouseEvent<HTMLButtonElement>,
+                                ) => {
+                                  e.stopPropagation();
+                                  handleDeleteRow(c);
+                                }}
+                                aria-label="Delete"
+                              />
+                            </div>
+                          </Table.Cell>
+                        </Table.Row>
+                      );
+                    })
+                  )}
+                </>
+              )}
+            </Table>
+          </div>
+        </main>
+      </div>
+
+      <CreateProduct
+        open={openCreateProduct}
+        setOpen={(isOpen: boolean) => {
+          setOpenCreateProduct(isOpen);
+          if (!isOpen) setEditProductType(null);
+        }}
+        onNewProductType={handleNewProductType}
+        onDeleteProductType={handleDeleteProductType}
+        productTypes={productTypes}
+        editProductType={editProductType}
+      />
+      <DeleteProductModal
+        open={!!deleteTarget}
+        setOpen={(isOpen: boolean) => {
+          if (!isOpen) setDeleteTarget(null);
+        }}
+        productName={
+          deleteTarget?.productLongName || deleteTarget?.productName || ""
+        }
+        onConfirmDelete={confirmDelete}
+        deleting={deleting}
+      />
+      <DeleteProductModal
+        open={!!deleteRowTarget}
+        setOpen={(isOpen: boolean) => {
+          if (!isOpen) {
+            setDeleteRowTarget(null);
+            setDeleteRowError(null);
+          }
+        }}
+        heading="Delete product"
+        productName={deleteRowTarget?.long_name || ""}
+        onConfirmDelete={confirmDeleteRow}
+        deleting={deletingRow}
+        error={deleteRowError}
+      />
+      {confirmGen && (
+        <DialogLayout
+          open={!!confirmGen}
+          onOpenChange={(o: boolean) => {
+            if (!o) setConfirmGen(null);
+          }}
+        >
+          <div className="flex w-full max-w-[440px] flex-col gap-4 p-6">
+            <span className="text-heading-3 font-heading-3 text-default-font">
+              Already generating
+            </span>
+            <span className="text-body font-body text-subtext-color">
+              {longNameForType(confirmGen.type)} is already being generated
+              {confirmGen.by
+                ? ` by ${confirmGen.by === user?.userId ? "you" : confirmGen.by}`
+                : ""}
+              . Generate another copy anyway?
+            </span>
+            <div className="flex items-center justify-end gap-2">
+              <Button
+                variant="neutral-secondary"
+                onClick={() => setConfirmGen(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="brand-primary"
+                onClick={() => {
+                  const t = confirmGen.type;
+                  setConfirmGen(null);
+                  void doGenerate(t);
+                }}
+              >
+                Generate anyway
+              </Button>
+            </div>
+          </div>
+        </DialogLayout>
+      )}
+    </DefaultPageLayout>
+  );
+}
+
+export default WhiteCellHome;

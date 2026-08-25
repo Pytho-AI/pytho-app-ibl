@@ -1,0 +1,339 @@
+# =============================================================================
+# docker-compose.vcorps.yml — V Corps scenario OVERRIDE
+# -----------------------------------------------------------------------------
+# This is a docker-compose OVERRIDE file. It DOES NOT stand alone — it layers
+# on top of docker-compose.yml and only redeclares fields that differ for the
+# V Corps scenario stack (port shifts, env vars, scenario.py swap, separate
+# volumes, separate network, separate container names).
+#
+# Invoke with:
+#   docker compose -p pytho-vcorps \
+#     -f docker-compose.yml \
+#     -f docker-compose.vcorps.yml \
+#     up -d
+# Or via the wrapper script:
+#   ./rebuild.sh --project vcorps <target>
+#
+# Preconditions (run ONCE on the host before first `up`):
+#   docker network create pytho-net-vcorps
+#   sudo mkdir -p data-vcorps/{models,data,uploads,resources,es-data,ergo,ollama,sd-models,sd-outputs} \
+#                 logs-vcorps manual_injects-vcorps ui/dist-vcorps
+#   sudo chown -R 1000:1000 data-vcorps logs-vcorps manual_injects-vcorps
+#   ls app/app/utils/scenario_vcorps.py >/dev/null   # scenario file must exist
+#
+# Isolation model:
+#   * Project name `pytho-vcorps` keeps compose state separate from IDX 26
+#     (`pytho-app`).
+#   * Every container_name suffixed `-vcorps` so both stacks coexist.
+#   * Every host-bound port shifted +10000.
+#   * Every named/bind volume gets a `-vcorps` suffix or dedicated subtree.
+#   * Network `pytho-net-vcorps` declared `external: true`.
+#
+# Scenario.py swap mechanism:
+#   docker-api image bakes /app/utils/scenario.py from app/app/utils/. The
+#   override bind-mounts ./app/app/utils/scenario_vcorps.py over that path
+#   read-only — SAME image, DIFFERENT scenario by file mount. No rebuild.
+# =============================================================================
+
+networks:
+    pytho-net:
+        # V Corps stack uses pytho-net-vcorps as its DEFAULT network so service
+        # name resolution stays within the project. Network aliases (see each
+        # service below) make the V Corps containers reachable by either their
+        # vcorps name OR the base name so nginx upstreams resolve.
+        name: pytho-net-vcorps
+        external: true
+    # NO other networks. geo-agent (:9845) and the shared editor (:9980)
+    # are standalone services reached over host-published ports via
+    # host.docker.internal. Per-map-UUID isolation (PYTHO_MASTER_MAP_UUID)
+    # keeps V Corps writes scoped to the V Corps master map.
+
+volumes:
+    es-config-vcorps:
+
+services:
+    docker-api:
+        container_name: docker-api-vcorps
+        # V Corps stack is SELF-CONTAINED on pytho-net-vcorps. External
+        # services (geo-agent :9845, the shared editor :9980) are reached
+        # over host-published ports via host.docker.internal — never a
+        # shared docker network. `docker-api` resolves within this
+        # project's own network only; no cross-stack DNS ambiguity.
+        networks:
+            pytho-net:
+                aliases:
+                    - docker-api
+                    - docker-api-vcorps
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        environment:
+            CONTAINER_ID: docker-api-vcorps-1
+            # UUID4 distinct from IDX 26's master map UUID (e279c951-...).
+            # Read by handlers/intel_agent + handlers/bda_autofire via
+            # PYTHO_MASTER_MAP_UUID.
+            PYTHO_MASTER_MAP_UUID: "00000000-0000-4000-8000-000000000002"
+            PYTHO_UPLOADS_DIR: "/app/uploads"
+            # IDX 26 disables scenario fixtures because it has a live cougaar
+            # feed. V Corps has no live cougaar — KG.unit_red + TERRAIN
+            # primitives ARE the source of truth. Force fixtures on so
+            # SITEMP templated_units / range fans / EAs / AAs / phase lines
+            # all derive from scenario_vcorps.py.
+            PYTHO_DISABLE_SCENARIO_FIXTURES: "0"
+            # IDX 26's cougaar feed serves Donovian (Estonia) — wrong threat
+            # data for V Corps. Unset COUGAAR_BASE_URL so the adapter detects
+            # "unset" and disables itself (utils/cougaar_adapters.py:107),
+            # eliminating the 30s timeout + warning spam on every poll.
+            # Scenario preload becomes the ONLY source of unit/target data.
+            COUGAAR_BASE_URL: ""
+            # geo-agent standalone service — host-published port, ONE knob.
+            GEO_API_URL: "http://host.docker.internal:9845"
+            # WOPI host the V Corps docker-api advertises in the WOPISrc
+            # URL. The shared editor lives in the IDX 26 stack and reaches
+            # this docker-api over its host-published port below (18008);
+            # the editor's aliasgroup2 whitelists this exact host:port.
+            WOPI_INTERNAL_BASE: "http://host.docker.internal:18008"
+        # Host-published port — the shared editor (IDX 26 stack) fetches
+        # WOPI CheckFileInfo/GetFile/PutFile from here via
+        # host.docker.internal:18008 (18008 because 8000 is IDX 26's
+        # docker-api and 18000 is vllm_node on the host).
+        ports: !override
+            - "18008:8000"
+        volumes:
+            - ./data-vcorps/models:/app/models
+            - ./data-vcorps/data:/app/data
+            - ./data-vcorps/uploads:/app/uploads
+            - ./data-vcorps/resources:/app/resources
+            - ./logs-vcorps:/app/logs
+            - ./manual_injects-vcorps:/app/manual_injects:ro
+            # THE scenario.py swap.
+            - ./app/app/utils/scenario_vcorps.py:/app/utils/scenario.py:ro
+            # intel_agent.py V Corps overlay — same handler as IDX 26's
+            # baked-in copy plus the `threat_actor` session header resolver
+            # that bridges KG.threat_actor ("7th CAA (OCCASUS Alliance)")
+            # into the Threat Model / Threat Capability Statement headers
+            # instead of falling back to the schema default
+            # ("Donovian Armed Forces" — IDX 26 era). Bind-mount keeps the
+            # change V Corps-only; IDX 26 docker-api continues to use the
+            # baked copy unchanged. When the change has soaked, fold it
+            # into the baked source so the bind-mount can be removed.
+            - ./app/app/handlers/intel_agent.py:/app/handlers/intel_agent.py:ro
+            # dag_executor.py V Corps overlay — same runtime as IDX 26's
+            # baked copy plus the derive:observation_source branch that
+            # emits "OOB / scenario fixture" for fixture-derived rows
+            # (no kbID) instead of mis-attributing them to the Cougaar
+            # vertex type "OOB / IDXEnemyOrderOfBattleReport". Affects
+            # every templated row across SITEMP, Threat Overlay, etc.
+            - ./app/app/runtime/dag_executor.py:/app/runtime/dag_executor.py:ro
+            # threat_capability_statement.py V Corps overlay — schema
+            # `ref:Threat Template` dependency replaced with
+            # `ref:Threat Overlay`. Per ATP 2-01.3 §5-45 the two names
+            # refer to the same product (the rendered DOCTEMP graphic +
+            # tactics + HVT-ID payload); PRODUCT_SCHEMAS only registers
+            # "Threat Overlay" as the standalone product, so the
+            # original dep silently emitted a MISSING PRECURSOR marker.
+            # IDX 26's baked copy retains the old dep until the change
+            # is folded into the baked image cross-stack.
+            - ./app/app/templates/products/threat_capability_statement.py:/app/templates/products/threat_capability_statement.py:ro
+            # common.py V Corps overlay — adds HARD_RULES_REGISTRY +
+            # hard_rules_for() helper that the DAG writer prompt assembly
+            # in dag_executor.py imports. Carries the ICD-203 likelihood
+            # scale + confidence-vs-likelihood + assumptions-vs-judgments
+            # rules + analysis-of-alternatives + clear-argumentation rules
+            # so every product writer reads them as the LAST block of its
+            # system prompt. IDX 26 keeps the baked common.py until this
+            # change folds into the image cross-stack.
+            - ./app/app/templates/common.py:/app/templates/common.py:ro
+            # enemy_course_of_action.py V Corps overlay — TCOAS schema
+            # spec. Moves the five-element deception worksheet (FALSE
+            # READ / DECEPTION ACTION / MASS / COMMITMENT TRIGGER /
+            # SIGNATURE DISAMBIGUATION) OUT of probability_rationale and
+            # INTO statement.how (elements 1-4) + distinguishing_
+            # characteristics (element 5) so the rationale field only
+            # carries the ICD-203 likelihood judgment + reasoning chain
+            # + likelihood-axis COA comparison per HARD_RULES.
+            # Previously the field-level + hard_rules guidance for
+            # most_deceptive=True COAs directed gemma4 to fill
+            # probability_rationale with deception-template content,
+            # which competed with the HARD_RULES ICD-203 contract and
+            # surfaced as TCOAS COA-4 missing the mandatory comparative-
+            # framing on the 2026-06-30 verify cascade.
+            - ./app/app/templates/products/enemy_course_of_action.py:/app/templates/products/enemy_course_of_action.py:ro
+            # exporter.py V Corps overlay — honors `strict_subfields:
+            # False` on nested dict item_subfields so the writer's
+            # doctrinally-driven emission subset (functional_allocation
+            # role-bins per operation type) is what the renderer surfaces,
+            # rather than the schema-declared union with `—` for
+            # inapplicable role-bins.
+            - ./app/app/utils/exporter.py:/app/utils/exporter.py:ro
+            # artifact_map_refresh.py V Corps overlay — reads the
+            # editor's internal base URL from WOPI_INTERNAL_BASE env
+            # (already set to http://docker-api-vcorps:8000 above) when
+            # constructing the editor_image_url passed to Collabora's
+            # replace_picture UNO call. Previously the URL was hardcoded
+            # to `http://docker-api:8000/files/...` which on V Corps hits
+            # IDX 26's docker-api (via the docker-api network alias
+            # aliased from BOTH IDX 26's and V Corps's docker-api
+            # containers on the shared pytho-net) — IDX 26 returns 404
+            # because V Corps artifacts live in ./data-vcorps/uploads/
+            # not in IDX 26's uploads tree, so the UNO GraphicProvider
+            # queryGraphic call fails and the Done-editing swap reports
+            # `error: graphic not loadable`. Also fixes the WOPI
+            # allowlist rejection — the V Corps editor's aliasgroup1
+            # whitelists `docker-api-vcorps:8000` only.
+            - ./app/app/handlers/artifact_map_refresh.py:/app/handlers/artifact_map_refresh.py:ro
+
+    scenario-ntp:
+        container_name: scenario-ntp-vcorps
+        networks:
+            pytho-net:
+                aliases:
+                    - scenario-ntp
+                    - scenario-ntp-vcorps
+        environment:
+            SCENARIO_CLOCK_URL: http://docker-api-vcorps:8000/api/scenario-clock
+            NTP_BIND_PORT: "123"
+        ports: !override
+            - "0.0.0.0:1230:123/udp"
+
+    # `editor` (Collabora) is intentionally NOT overridden here. V Corps
+    # shares the IDX 26 agent-editor container — the editor is stateless
+    # and document identity is the WOPI URL, not the container. The base
+    # editor's aliasgroup2 whitelists `docker-api-vcorps:8000` so
+    # V Corps WOPI URLs open cleanly, and its allowed_websocket_origins
+    # includes the V Corps 10443 origins. V Corps nginx (nginx-vcorps.conf)
+    # proxies /browser/, /hosting/, /cool/, /coolws/ to agent-editor.
+    # A standalone agent-editor-vcorps was stood up during initial parallel-
+    # stack bring-up and torn down — it caused Docker DNS ambiguity on the
+    # shared pytho-net (both editors aliased as `editor`), required
+    # duplicate patch-editor.sh runs for the offline debs, and split
+    # tile-invalidation state that only one editor could carry consistently.
+
+    ergo:
+        container_name: agent-chat-vcorps
+        networks:
+            pytho-net:
+                aliases:
+                    - ergo
+                    - agent-chat
+                    - agent-chat-vcorps
+        ports: !override
+            - "127.0.0.1:18097:8097"
+        volumes:
+            - ./ergo/ircd.yaml:/ircd/ircd.yaml:ro
+            - ./data-vcorps/ergo:/ircd-data
+
+    nginx:
+        container_name: proxy-app-vcorps
+        networks:
+            pytho-net:
+                aliases:
+                    - nginx
+                    - proxy-app
+                    - proxy-app-vcorps
+        # geo-agent (:9845) + the shared editor (:9980) are reached over
+        # host-published ports via host.docker.internal — see the upstream
+        # blocks in nginx/nginx-vcorps.conf.
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        build:
+            # See docker-compose.yml — repo-root context, per-env
+            # Dockerfile under nginx/. vcorps uses the edge Dockerfile
+            # + the vcorps-specific conf bind-mounted below.
+            context: .
+            dockerfile: nginx/Dockerfile.edge
+            args:
+                # VITE_OFFLINE_MODE was removed 2026-07-01 — the frontend
+                # always fetches from the local tileserver via nginx
+                # /tiles. V Corps's BPTA / Elk-corridor AOR needs BPTA
+                # terrain + basemap mbtiles preloaded into the shared
+                # tileserver for anything below z=8 to render at that AO;
+                # until then MapLibre 404s the tile requests and only the
+                # continent-wide OMT vector layers (openmaptiles,
+                # bounds=[-34.49, 29.73, 46.75, 81.47]) draw. Preloading
+                # BPTA rasters is a tileserver-side task tracked as
+                # "BPTA tile preload" in scratch/ibl/joe-test/vcorps-
+                # deployment-runbook.md.
+                # Relative — the browser hits this stack's nginx, whose
+                # /geo-api/ block rewrites to /api/ and proxies to the
+                # standalone geo-agent at host.docker.internal:9845.
+                VITE_GEO_AGENT_API_URL: "/geo-api/v1"
+                # V Corps master map UUID — must match docker-api-vcorps
+                # PYTHO_MASTER_MAP_UUID env var so the analyst CONOP /
+                # OperationsMap surface reads the same map the backend's
+                # OOB poll + per-product overlay mirror writes to.
+                # Without this the bundled fallback (e279c951... — the
+                # IDX 26 Voru-Tartu master) sends every V Corps user to
+                # the IDX 26 map and shows IDX 26 OOB.
+                VITE_DEFAULT_MAP_ID: "00000000-0000-4000-8000-000000000002"
+                # Default map center + zoom: BPTA / Elk corridor. The
+                # IDX 26 default (26.82, 57.96) lands the analyst over
+                # eastern Estonia, not Poland. Center on OBJ JACKSON
+                # area; zoom 8.5 covers BPTA + Elk corridor + FAA belt.
+                VITE_DEFAULT_CENTER_LON: "22.0"
+                VITE_DEFAULT_CENTER_LAT: "53.74"
+                VITE_DEFAULT_ZOOM: "8.5"
+                VITE_COA_WS_URL: ${VITE_COA_WS_URL:-}
+                VITE_COA_API_URL: ${VITE_COA_API_URL:-}
+                VITE_SHOW_APP_RAIL: ${VITE_SHOW_APP_RAIL:-false}
+        ports: !override
+            - "0.0.0.0:10080:80"
+            - "0.0.0.0:10443:443"
+        volumes:
+            # nginx-vcorps.conf is a copy of nginx.conf with upstreams
+            # rewritten to the explicit -vcorps container names
+            # (docker-api-vcorps:8000, agent-editor-vcorps:9980,
+            # agent-chat-vcorps:8097). Required because proxy-app-vcorps
+            # is dual-homed on pytho-net-vcorps + pytho-net (for
+            # geo-agent reachability); the base name `docker-api`
+            # resolves to the IDX 26 container on the shared network,
+            # causing V Corps UI to silently read/write IDX 26's DB.
+            # Using explicit -vcorps suffixed names bypasses the
+            # ambiguous DNS resolution and guarantees clean isolation.
+            - ./nginx/nginx-vcorps.conf:/etc/nginx/conf.d/nginx.conf:ro
+            - ./nginx/nginx-main.conf:/etc/nginx/nginx.conf:ro
+            # V Corps nginx serves from ui/dist-vcorps so a parallel
+            # IDX 26 nginx rebuild does NOT overwrite the V Corps bundle.
+            # ./rebuild.sh --project vcorps nginx extracts to ui/dist-vcorps/.
+            - ./ui/dist-vcorps:/usr/share/nginx/html:ro
+
+    es-secure:
+        container_name: es-secure-vcorps
+        ports: !override
+            - "127.0.0.1:19200:9200"
+            - "127.0.0.1:19300:9300"
+        volumes:
+            - ./data-vcorps/es-data:/usr/share/elasticsearch/data
+            - es-config-vcorps:/usr/share/elasticsearch/config
+
+    stability-api-gpu:
+        container_name: stability_api_gpu_vcorps
+        ports: !override
+            - "127.0.0.1:17860:17860"
+        volumes:
+            - ./data-vcorps/sd-models:/opt/stable-diffusion-webui/models
+            - ./data-vcorps/sd-outputs:/opt/stable-diffusion-webui/outputs
+
+    stability-api-cpu:
+        container_name: stability_api_cpu_vcorps
+        ports: !override
+            - "127.0.0.1:17860:17860"
+        volumes:
+            - ./data-vcorps/sd-models:/opt/stable-diffusion-webui/models
+            - ./data-vcorps/sd-outputs:/opt/stable-diffusion-webui/outputs
+
+    kokoro-tts:
+        container_name: kokoro_tts_vcorps
+        ports: !override
+            - "127.0.0.1:18880:8880"
+
+    ollama:
+        container_name: ollama-vcorps
+        ports: !override
+            - "127.0.0.1:21434:11434"
+        volumes:
+            - ./data-vcorps/ollama:/root/.ollama
+
+    ollama-init:
+        container_name: ollama-init-vcorps
+        environment:
+            - OLLAMA_HOST=ollama-vcorps:11434

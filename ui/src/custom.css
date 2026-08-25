@@ -1,0 +1,11 @@
+.report-table {
+  @apply mt-6 border w-full;
+}
+
+.report-th, .report-tr, .report-td {
+  @apply border p-4;
+}
+
+.report-ol, .report-ul {
+  @apply pl-6;
+}

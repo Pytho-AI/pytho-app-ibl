@@ -1,0 +1,10 @@
+{
+  "name": "docx-converter",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "docx": "^9.0.0",
+    "jszip": "^3.10.0"
+  }
+}

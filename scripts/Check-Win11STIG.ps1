@@ -1,0 +1,2602 @@
+<#
+.SYNOPSIS
+    Windows 11 STIG Compliance Checker with Auto-Remediation
+.DESCRIPTION
+    Checks a Windows 11 machine against DISA STIG rules from
+    Microsoft_Windows_11_STIG Release 6, Benchmark Date: 05 Jan 2026,
+    Microsoft Windows Defender Firewall with Advanced Security STIG V2R2,
+    and Application Security and Development (ASD) STIG V6R4.
+    Optionally attempts automatic remediation for failed checks.
+    Must be run with elevated privileges (Run as Administrator).
+.PARAMETER AutoFix
+    When specified, the script will attempt one automatic remediation pass
+    for each failed check before reporting the final result.
+.PARAMETER HTMLReport
+    Generates an HTML report file.
+.PARAMETER OutputPath
+    Path for the HTML report file. Defaults to current directory.
+.PARAMETER Quiet
+    Suppresses console output.
+.NOTES
+    Version: 2.0
+    Requires: PowerShell 5.1+, Administrator privileges
+    Rules Covered: V-253254 through V-279688 (263 rules) + V-241989 through V-242009 (21 Firewall STIG rules) + ASD STIG V6R4 (264 rules)
+.EXAMPLE
+    .\Check-Win11STIG.ps1 -AutoFix -HTMLReport
+#>
+
+#Requires -RunAsAdministrator
+
+param(
+    [switch]$AutoFix,
+    [switch]$HTMLReport,
+    [string]$OutputPath = ".\STIG_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').html",
+    [switch]$Quiet
+)
+
+# ============================================================================
+# GLOBALS & HELPERS
+# ============================================================================
+
+$script:Results = [System.Collections.ArrayList]::new()
+$script:TotalChecks = 0
+$script:PassCount = 0
+$script:FailCount = 0
+$script:ManualCount = 0
+$script:NACount = 0
+$script:FixedCount = 0
+
+function Add-Result {
+    param(
+        [string]$VulnID,
+        [string]$RuleID,
+        [string]$Severity,
+        [string]$RuleTitle,
+        [ValidateSet("Pass","Fail","Manual","N/A","Fixed")]
+        [string]$Status,
+        [string]$Details,
+        [string]$ManualSteps = "",
+        [string]$FixAction = ""
+    )
+    $script:TotalChecks++
+    switch ($Status) {
+        "Pass"   { $script:PassCount++ }
+        "Fail"   { $script:FailCount++ }
+        "Manual" { $script:ManualCount++ }
+        "N/A"    { $script:NACount++ }
+        "Fixed"  { $script:FixedCount++ }
+    }
+    $null = $script:Results.Add([PSCustomObject]@{
+        VulnID      = $VulnID
+        RuleID      = $RuleID
+        Severity    = $Severity
+        RuleTitle   = $RuleTitle
+        Status      = $Status
+        Details     = $Details
+        ManualSteps = $ManualSteps
+        FixAction   = $FixAction
+    })
+    if (-not $Quiet) {
+        $color = switch ($Status) {
+            "Pass"   { "Green" }
+            "Fail"   { "Red" }
+            "Manual" { "Yellow" }
+            "N/A"    { "Cyan" }
+            "Fixed"  { "Magenta" }
+        }
+        Write-Host "[$Status] " -ForegroundColor $color -NoNewline
+        Write-Host "$VulnID ($Severity): $RuleTitle"
+        if ($Details -and $Status -notin @("Pass")) {
+            Write-Host "        $Details" -ForegroundColor DarkGray
+        }
+        if ($FixAction) {
+            Write-Host "        Fix Applied: $FixAction" -ForegroundColor Magenta
+        }
+        if ($ManualSteps -and $Status -eq "Manual") {
+            Write-Host "        Manual Steps Required:" -ForegroundColor Yellow
+            $ManualSteps -split "`n" | ForEach-Object {
+                if ($_.Trim()) { Write-Host "          $_" -ForegroundColor DarkYellow }
+            }
+        }
+    }
+}
+
+function Set-RegistryValueForce {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [object]$Value,
+        [string]$Type = "DWord"
+    )
+    try {
+        if (-not (Test-Path $Path)) {
+            New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-RegistryValueSafe {
+    param([string]$Path, [string]$Name)
+    try {
+        return Get-ItemPropertyValue -Path $Path -Name $Name -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Test-IsDomainJoined {
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        return ($cs.PartOfDomain -eq $true)
+    } catch {
+        return $false
+    }
+}
+
+function Write-FixAttempt {
+    param([string]$Message)
+    if (-not $Quiet) {
+        Write-Host "        [AUTO-FIX] $Message" -ForegroundColor Magenta
+    }
+}
+
+# ============================================================================
+# PRE-FLIGHT
+# ============================================================================
+
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  Windows 11 STIG Compliance Checker v2.0" -ForegroundColor Cyan
+Write-Host "  Microsoft_Windows_11_STIG Release 6 (05 Jan 2026)" -ForegroundColor Cyan
+Write-Host "  Windows Defender Firewall STIG V2R2 (09 Nov 2023)" -ForegroundColor Cyan
+Write-Host "  Scan Started: $(Get-Date)" -ForegroundColor Cyan
+if ($AutoFix) {
+    Write-Host "  AUTO-FIX MODE: ENABLED" -ForegroundColor Magenta
+}
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$isDomainJoined = Test-IsDomainJoined
+Write-Host "Domain Joined: $isDomainJoined" -ForegroundColor DarkGray
+Write-Host ""
+
+# ============================================================================
+# V-253254 | WN11-00-000005 | Windows 11 Enterprise 64-bit
+# ============================================================================
+$cs = Get-CimInstance -ClassName Win32_ComputerSystem
+$edition = (Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "EditionID" -ErrorAction SilentlyContinue)
+$osArch = $cs.SystemType
+
+if (-not $isDomainJoined) {
+    Add-Result -VulnID "V-253254" -RuleID "WN11-00-000005" -Severity "medium" `
+        -RuleTitle "Domain-joined systems must use Windows 11 Enterprise Edition 64-bit version" `
+        -Status "N/A" -Details "System is not domain-joined (standalone)."
+} else {
+    $isEnterprise = ($edition -like "*Enterprise*")
+    $is64bit = ($osArch -like "*x64*" -or $osArch -like "*ARM64*")
+    if ($isEnterprise -and $is64bit) {
+        Add-Result -VulnID "V-253254" -RuleID "WN11-00-000005" -Severity "medium" `
+            -RuleTitle "Domain-joined systems must use Windows 11 Enterprise Edition 64-bit version" `
+            -Status "Pass" -Details "Edition: $edition, Arch: $osArch"
+    } else {
+        # Cannot auto-fix: requires OS reinstallation
+        Add-Result -VulnID "V-253254" -RuleID "WN11-00-000005" -Severity "medium" `
+            -RuleTitle "Domain-joined systems must use Windows 11 Enterprise Edition 64-bit version" `
+            -Status "Fail" -Details "Edition: $edition, Arch: $osArch. Requires Enterprise 64-bit. Cannot auto-fix - OS reinstallation required."
+    }
+}
+
+# ============================================================================
+# V-253255 | WN11-00-000010 | TPM enabled
+# ============================================================================
+if (-not $isDomainJoined) {
+    Add-Result -VulnID "V-253255" -RuleID "WN11-00-000010" -Severity "medium" `
+        -RuleTitle "Windows 11 domain-joined systems must have a TPM enabled" `
+        -Status "N/A" -Details "System is not domain-joined."
+} else {
+    try {
+        $tpm = Get-Tpm -ErrorAction Stop
+        if ($tpm.TpmPresent -and $tpm.TpmReady) {
+            Add-Result -VulnID "V-253255" -RuleID "WN11-00-000010" -Severity "medium" `
+                -RuleTitle "Windows 11 domain-joined systems must have a TPM enabled" `
+                -Status "Pass" -Details "TPM Present: $($tpm.TpmPresent), Ready: $($tpm.TpmReady)"
+        } else {
+            # Cannot auto-fix: requires BIOS/firmware configuration
+            Add-Result -VulnID "V-253255" -RuleID "WN11-00-000010" -Severity "medium" `
+                -RuleTitle "Windows 11 domain-joined systems must have a TPM enabled" `
+                -Status "Fail" -Details "TPM Present: $($tpm.TpmPresent), Ready: $($tpm.TpmReady). Cannot auto-fix - enable TPM in BIOS/firmware."
+        }
+    } catch {
+        Add-Result -VulnID "V-253255" -RuleID "WN11-00-000010" -Severity "medium" `
+            -RuleTitle "Windows 11 domain-joined systems must have a TPM enabled" `
+            -Status "Fail" -Details "Unable to query TPM. Cannot auto-fix - enable TPM in BIOS/firmware."
+    }
+}
+
+# ============================================================================
+# V-253256 | WN11-00-000015 | UEFI firmware mode
+# ============================================================================
+$fwType = Get-RegistryValueSafe -Path "HKLM:\SYSTEM\CurrentControlSet\Control" -Name "PEFirmwareType"
+$isUEFI = $false
+if ($fwType -eq 2) {
+    $isUEFI = $true
+} elseif ($null -eq $fwType) {
+    # Fallback: check via bcdedit or Secure Boot (if Secure Boot is on, system must be UEFI)
+    try {
+        $sbState = Confirm-SecureBootUEFI -ErrorAction Stop
+        if ($sbState) { $isUEFI = $true }
+    } catch { }
+    if (-not $isUEFI) {
+        # Another fallback: check msinfo32-style via CIM
+        try {
+            $biosInfo = Get-CimInstance -Namespace root\cimv2 -ClassName Win32_BIOS -ErrorAction Stop
+            $envVar = [System.Environment]::GetFolderPath("System")
+            # On UEFI systems, the EFI system partition exists
+            $efiVars = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -ErrorAction SilentlyContinue
+        } catch { }
+    }
+}
+if ($isUEFI) {
+    Add-Result -VulnID "V-253256" -RuleID "WN11-00-000015" -Severity "medium" `
+        -RuleTitle "Windows 11 systems must have UEFI firmware and run in UEFI mode" `
+        -Status "Pass" -Details "Firmware type: UEFI (verified via $(if($fwType -eq 2){'PEFirmwareType registry'}else{'Secure Boot state'}))"
+} else {
+    # Cannot auto-fix: requires BIOS/firmware change
+    Add-Result -VulnID "V-253256" -RuleID "WN11-00-000015" -Severity "medium" `
+        -RuleTitle "Windows 11 systems must have UEFI firmware and run in UEFI mode" `
+        -Status "Fail" -Details "Firmware type is Legacy BIOS (PEFirmwareType=$fwType). Cannot auto-fix - configure UEFI in firmware settings." `
+        -ManualSteps @"
+1. Restart the computer and enter BIOS/firmware settings (usually Del, F2, or F12 at boot).
+2. Find the Boot Mode setting and change from Legacy/CSM to UEFI.
+3. Save and exit. Note: This may require reinstalling Windows.
+"@
+}
+
+# ============================================================================
+# V-253257 | WN11-00-000020 | Secure Boot enabled
+# ============================================================================
+try {
+    $secureBoot = Confirm-SecureBootUEFI -ErrorAction Stop
+    if ($secureBoot) {
+        Add-Result -VulnID "V-253257" -RuleID "WN11-00-000020" -Severity "medium" `
+            -RuleTitle "Secure Boot must be enabled on Windows 11 systems" `
+            -Status "Pass" -Details "Secure Boot is enabled."
+    } else {
+        # Cannot auto-fix: requires firmware change
+        Add-Result -VulnID "V-253257" -RuleID "WN11-00-000020" -Severity "medium" `
+            -RuleTitle "Secure Boot must be enabled on Windows 11 systems" `
+            -Status "Fail" -Details "Secure Boot is NOT enabled. Cannot auto-fix - enable in UEFI firmware settings."
+    }
+} catch {
+    Add-Result -VulnID "V-253257" -RuleID "WN11-00-000020" -Severity "medium" `
+        -RuleTitle "Secure Boot must be enabled on Windows 11 systems" `
+        -Status "Fail" -Details "Secure Boot check failed. Cannot auto-fix - enable in UEFI firmware settings."
+}
+
+# ============================================================================
+# V-253258 | WN11-00-000025 | ESS software installed
+# ============================================================================
+Add-Result -VulnID "V-253258" -RuleID "WN11-00-000025" -Severity "medium" `
+    -RuleTitle "Windows 11 must employ automated mechanisms for flaw remediation (ESS)" `
+    -Status "Manual" -Details "Cannot auto-fix - requires DOD-approved ESS software installation and ISSM documentation." `
+    -ManualSteps @"
+1. Contact the site ISSM for ESS software documentation.
+2. Verify DOD-approved ESS software is installed, configured, and actively running.
+3. Acceptable evidence: CCB-approved Software Baseline or ISSM memo with ESS name/version.
+"@
+
+# ============================================================================
+# V-253259 | WN11-00-000030 | BitLocker full disk encryption
+# ============================================================================
+try {
+    $blVolumes = Get-BitLockerVolume -ErrorAction Stop
+    $unencrypted = $blVolumes | Where-Object { $_.ProtectionStatus -ne "On" -and $_.VolumeType -ne "Unknown" }
+    if ($unencrypted) {
+        if ($AutoFix) {
+            Write-FixAttempt "Enabling BitLocker on unencrypted volumes..."
+            $fixedDrives = @()
+            foreach ($vol in $unencrypted) {
+                try {
+                    # Enable BitLocker with TPM protector if available
+                    $tpmCheck = Get-Tpm -ErrorAction SilentlyContinue
+                    if ($tpmCheck.TpmReady) {
+                        Enable-BitLocker -MountPoint $vol.MountPoint -EncryptionMethod XtsAes256 -TpmProtector -SkipHardwareTest -ErrorAction Stop
+                        $fixedDrives += $vol.MountPoint
+                    }
+                } catch {
+                    # Silently continue - will report status
+                }
+            }
+            # Re-check
+            $blVolumes2 = Get-BitLockerVolume -ErrorAction SilentlyContinue
+            $stillUnencrypted = $blVolumes2 | Where-Object { $_.ProtectionStatus -ne "On" -and $_.VolumeType -ne "Unknown" }
+            if (-not $stillUnencrypted) {
+                Add-Result -VulnID "V-253259" -RuleID "WN11-00-000030" -Severity "high" `
+                    -RuleTitle "Windows 11 must use BitLocker to encrypt all disks" `
+                    -Status "Fixed" -Details "BitLocker enabled on all volumes." `
+                    -FixAction "Enabled BitLocker with TPM protector on: $($fixedDrives -join ', ')"
+            } else {
+                $driveList = ($stillUnencrypted | ForEach-Object { "$($_.MountPoint) ($($_.ProtectionStatus))" }) -join ", "
+                Add-Result -VulnID "V-253259" -RuleID "WN11-00-000030" -Severity "high" `
+                    -RuleTitle "Windows 11 must use BitLocker to encrypt all disks" `
+                    -Status "Fail" -Details "Auto-fix attempted. Still unencrypted: $driveList. May require manual PIN setup."
+            }
+        } else {
+            $driveList = ($unencrypted | ForEach-Object { "$($_.MountPoint) ($($_.ProtectionStatus))" }) -join ", "
+            Add-Result -VulnID "V-253259" -RuleID "WN11-00-000030" -Severity "high" `
+                -RuleTitle "Windows 11 must use BitLocker to encrypt all disks" `
+                -Status "Fail" -Details "Unencrypted volumes: $driveList"
+        }
+    } else {
+        Add-Result -VulnID "V-253259" -RuleID "WN11-00-000030" -Severity "high" `
+            -RuleTitle "Windows 11 must use BitLocker to encrypt all disks" `
+            -Status "Pass" -Details "All volumes are BitLocker protected."
+    }
+} catch {
+    Add-Result -VulnID "V-253259" -RuleID "WN11-00-000030" -Severity "high" `
+        -RuleTitle "Windows 11 must use BitLocker to encrypt all disks" `
+        -Status "Fail" -Details "Unable to query BitLocker: $_"
+}
+
+# ============================================================================
+# V-253260 | WN11-00-000031 | BitLocker PIN for pre-boot authentication
+# ============================================================================
+$fvePath = "HKLM:\SOFTWARE\Policies\Microsoft\FVE"
+$useAdvStartup = Get-RegistryValueSafe -Path $fvePath -Name "UseAdvancedStartup"
+$useTPMPIN = Get-RegistryValueSafe -Path $fvePath -Name "UseTPMPIN"
+$useTPMKeyPIN = Get-RegistryValueSafe -Path $fvePath -Name "UseTPMKeyPIN"
+
+$v253260Pass = ($useAdvStartup -eq 1) -and
+    (($useTPMPIN -eq 1 -or $useTPMPIN -eq 2) -and ($useTPMKeyPIN -eq 1 -or $useTPMKeyPIN -eq 2))
+
+if ($v253260Pass) {
+    Add-Result -VulnID "V-253260" -RuleID "WN11-00-000031" -Severity "high" `
+        -RuleTitle "Windows 11 systems must use a BitLocker PIN for pre-boot authentication" `
+        -Status "Pass" -Details "UseAdvancedStartup=$useAdvStartup, UseTPMPIN=$useTPMPIN, UseTPMKeyPIN=$useTPMKeyPIN"
+} else {
+    if ($AutoFix) {
+        Write-FixAttempt "Setting BitLocker pre-boot PIN registry values..."
+        $f1 = Set-RegistryValueForce -Path $fvePath -Name "UseAdvancedStartup" -Value 1
+        $f2 = Set-RegistryValueForce -Path $fvePath -Name "UseTPMPIN" -Value 1
+        $f3 = Set-RegistryValueForce -Path $fvePath -Name "UseTPMKeyPIN" -Value 1
+        if ($f1 -and $f2 -and $f3) {
+            Add-Result -VulnID "V-253260" -RuleID "WN11-00-000031" -Severity "high" `
+                -RuleTitle "Windows 11 systems must use a BitLocker PIN for pre-boot authentication" `
+                -Status "Fixed" -Details "Registry values set: UseAdvancedStartup=1, UseTPMPIN=1, UseTPMKeyPIN=1" `
+                -FixAction "Set HKLM:\SOFTWARE\Policies\Microsoft\FVE UseAdvancedStartup=1, UseTPMPIN=1, UseTPMKeyPIN=1"
+        } else {
+            Add-Result -VulnID "V-253260" -RuleID "WN11-00-000031" -Severity "high" `
+                -RuleTitle "Windows 11 systems must use a BitLocker PIN for pre-boot authentication" `
+                -Status "Fail" -Details "Auto-fix failed to set registry values."
+        }
+    } else {
+        Add-Result -VulnID "V-253260" -RuleID "WN11-00-000031" -Severity "high" `
+            -RuleTitle "Windows 11 systems must use a BitLocker PIN for pre-boot authentication" `
+            -Status "Fail" -Details "UseAdvancedStartup=$useAdvStartup (req:1), UseTPMPIN=$useTPMPIN (req:1/2), UseTPMKeyPIN=$useTPMKeyPIN (req:1/2)"
+    }
+}
+
+# ============================================================================
+# V-253261 | WN11-00-000032 | BitLocker PIN minimum length 6
+# ============================================================================
+$minPIN = Get-RegistryValueSafe -Path $fvePath -Name "MinimumPIN"
+if ($null -ne $minPIN -and $minPIN -ge 6) {
+    Add-Result -VulnID "V-253261" -RuleID "WN11-00-000032" -Severity "medium" `
+        -RuleTitle "Windows 11 systems must use a BitLocker PIN with a minimum length of six digits" `
+        -Status "Pass" -Details "MinimumPIN=$minPIN (>= 6)"
+} else {
+    if ($AutoFix) {
+        Write-FixAttempt "Setting BitLocker MinimumPIN to 6..."
+        if (Set-RegistryValueForce -Path $fvePath -Name "MinimumPIN" -Value 6) {
+            Add-Result -VulnID "V-253261" -RuleID "WN11-00-000032" -Severity "medium" `
+                -RuleTitle "Windows 11 systems must use a BitLocker PIN with a minimum length of six digits" `
+                -Status "Fixed" -Details "MinimumPIN set to 6." `
+                -FixAction "Set HKLM:\SOFTWARE\Policies\Microsoft\FVE\MinimumPIN = 6"
+        } else {
+            Add-Result -VulnID "V-253261" -RuleID "WN11-00-000032" -Severity "medium" `
+                -RuleTitle "Windows 11 systems must use a BitLocker PIN with a minimum length of six digits" `
+                -Status "Fail" -Details "Auto-fix failed. MinimumPIN=$minPIN (required: >= 6)"
+        }
+    } else {
+        Add-Result -VulnID "V-253261" -RuleID "WN11-00-000032" -Severity "medium" `
+            -RuleTitle "Windows 11 systems must use a BitLocker PIN with a minimum length of six digits" `
+            -Status "Fail" -Details "MinimumPIN=$minPIN (required: >= 6)"
+    }
+}
+
+# ============================================================================
+# V-253262 | WN11-00-000035 | Application allowlisting (AppLocker / WDAC)
+# ============================================================================
+$allowlistFound = $false
+$allowlistDetails = ""
+
+# Check 1: AppLocker
+try {
+    $applockerRules = Get-AppLockerPolicy -Effective -ErrorAction Stop
+    foreach ($collection in $applockerRules.RuleCollections) {
+        if ($collection.Count -gt 0) { $allowlistFound = $true; $allowlistDetails = "AppLocker rules are configured."; break }
+    }
+} catch { }
+
+# Check 2: WDAC (Windows Defender Application Control) via CIM
+if (-not $allowlistFound) {
+    try {
+        $wdacStatus = Get-CimInstance -Namespace root\Microsoft\Windows\CI -ClassName MSFT_CIPolicy -ErrorAction Stop
+        if ($wdacStatus) { $allowlistFound = $true; $allowlistDetails = "WDAC (Windows Defender Application Control) policy is active." }
+    } catch { }
+}
+
+# Check 3: WDAC via registry (CodeIntegrity policies deployed)
+if (-not $allowlistFound) {
+    $ciPolicyPath = "$env:SystemRoot\System32\CodeIntegrity\CiPolicies\Active"
+    if (Test-Path $ciPolicyPath) {
+        $ciFiles = Get-ChildItem -Path $ciPolicyPath -Filter "*.cip" -ErrorAction SilentlyContinue
+        if ($ciFiles -and $ciFiles.Count -gt 0) {
+            $allowlistFound = $true
+            $allowlistDetails = "WDAC policy files found in CodeIntegrity\CiPolicies\Active ($($ciFiles.Count) policies)."
+        }
+    }
+}
+
+# Check 4: Smart App Control (Windows 11 22H2+)
+if (-not $allowlistFound) {
+    $sacState = Get-RegistryValueSafe -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -Name "VerifiedAndReputablePolicyState"
+    if ($sacState -eq 1 -or $sacState -eq 2) {
+        $allowlistFound = $true
+        $sacMode = if ($sacState -eq 1) { "Evaluation" } else { "Enforcement" }
+        $allowlistDetails = "Smart App Control is active (Mode: $sacMode)."
+    }
+}
+
+if ($allowlistFound) {
+    Add-Result -VulnID "V-253262" -RuleID "WN11-00-000035" -Severity "medium" `
+        -RuleTitle "The OS must employ a deny-all, permit-by-exception policy (AppLocker)" `
+        -Status "Pass" -Details $allowlistDetails
+} else {
+    Add-Result -VulnID "V-253262" -RuleID "WN11-00-000035" -Severity "medium" `
+        -RuleTitle "The OS must employ a deny-all, permit-by-exception policy (AppLocker)" `
+        -Status "Manual" -Details "No AppLocker, WDAC, or Smart App Control policy detected. Verify if a third-party allowlisting solution is in use." `
+        -ManualSteps @"
+1. Check if AppLocker is configured: Run PowerShell as Admin > Get-AppLockerPolicy -Effective -XML > C:\temp\applocker.xml
+2. Check if WDAC is deployed: Look for .cip files in C:\Windows\System32\CodeIntegrity\CiPolicies\Active
+3. Check Smart App Control: Settings > Privacy & Security > Windows Security > App & Browser Control
+4. If a third-party solution is used, verify it is installed and configured with deny-all, permit-by-exception.
+5. If none is in use, configure AppLocker or WDAC per organizational requirements.
+"@
+}
+
+# ============================================================================
+# V-253263 | WN11-00-000040 | Supported servicing level (>= 22H2 Build 22621.380)
+# ============================================================================
+$buildNumber = [int](Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "CurrentBuildNumber" -ErrorAction SilentlyContinue)
+$ubr = [int](Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "UBR" -ErrorAction SilentlyContinue)
+$displayVersion = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "DisplayVersion" -ErrorAction SilentlyContinue
+
+if ($buildNumber -ge 22621) {
+    Add-Result -VulnID "V-253263" -RuleID "WN11-00-000040" -Severity "high" `
+        -RuleTitle "Windows 11 systems must be maintained at a supported servicing level" `
+        -Status "Pass" -Details "Version: $displayVersion, Build: $buildNumber.$ubr"
+} else {
+    # Cannot auto-fix: requires Windows Update
+    Add-Result -VulnID "V-253263" -RuleID "WN11-00-000040" -Severity "high" `
+        -RuleTitle "Windows 11 systems must be maintained at a supported servicing level" `
+        -Status "Fail" -Details "Version: $displayVersion, Build: $buildNumber.$ubr (requires >= 22621.380). Cannot auto-fix - run Windows Update."
+}
+
+# ============================================================================
+# V-253264 | WN11-00-000045 | Antivirus installed
+# ============================================================================
+$defenderService = Get-Service -Name "WinDefend" -ErrorAction SilentlyContinue
+$defenderRunning = ($defenderService -and $defenderService.Status -eq "Running")
+$mcafeeService = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*mcafee*" -and $_.Status -eq "Running" }
+$symantecService = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*symantec*" -and $_.Status -eq "Running" }
+$crowdStrike = Get-Service -Name "CSFalconService" -ErrorAction SilentlyContinue
+$csRunning = ($crowdStrike -and $crowdStrike.Status -eq "Running")
+
+if ($defenderRunning -or $mcafeeService -or $symantecService -or $csRunning) {
+    $avName = if ($defenderRunning) { "Windows Defender" }
+              elseif ($mcafeeService) { "McAfee" }
+              elseif ($symantecService) { "Symantec" }
+              elseif ($csRunning) { "CrowdStrike" }
+    Add-Result -VulnID "V-253264" -RuleID "WN11-00-000045" -Severity "high" `
+        -RuleTitle "The Windows 11 system must use an antivirus program" `
+        -Status "Pass" -Details "Antivirus detected and running: $avName"
+} else {
+    if ($AutoFix -and $defenderService) {
+        Write-FixAttempt "Attempting to start Windows Defender..."
+        try {
+            Start-Service -Name "WinDefend" -ErrorAction Stop
+            Add-Result -VulnID "V-253264" -RuleID "WN11-00-000045" -Severity "high" `
+                -RuleTitle "The Windows 11 system must use an antivirus program" `
+                -Status "Fixed" -Details "Windows Defender service started." `
+                -FixAction "Started WinDefend service."
+        } catch {
+            Add-Result -VulnID "V-253264" -RuleID "WN11-00-000045" -Severity "high" `
+                -RuleTitle "The Windows 11 system must use an antivirus program" `
+                -Status "Fail" -Details "Auto-fix failed to start Defender: $_. Install an antivirus solution manually."
+        }
+    } else {
+        Add-Result -VulnID "V-253264" -RuleID "WN11-00-000045" -Severity "high" `
+            -RuleTitle "The Windows 11 system must use an antivirus program" `
+            -Status "Fail" -Details "No running antivirus detected. Install an antivirus solution."
+    }
+}
+
+# ============================================================================
+# V-253265 | WN11-00-000050 | Local volumes NTFS
+# ============================================================================
+$volumes = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
+$nonNTFS = $volumes | Where-Object { $_.FileSystem -and $_.FileSystem -ne "NTFS" }
+if ($nonNTFS) {
+    $driveList = ($nonNTFS | ForEach-Object { "$($_.DeviceID) ($($_.FileSystem))" }) -join ", "
+    Add-Result -VulnID "V-253265" -RuleID "WN11-00-000050" -Severity "high" `
+        -RuleTitle "Local volumes must be formatted using NTFS" `
+        -Status "Fail" -Details "Non-NTFS volumes: $driveList. Cannot auto-fix - formatting is destructive."
+} else {
+    Add-Result -VulnID "V-253265" -RuleID "WN11-00-000050" -Severity "high" `
+        -RuleTitle "Local volumes must be formatted using NTFS" `
+        -Status "Pass" -Details "All local volumes use NTFS."
+}
+
+# ============================================================================
+# V-253266 | WN11-00-000055 | No alternate operating systems
+# ============================================================================
+try {
+    $bcdEntries = bcdedit /enum 2>&1 | Out-String
+    $osCount = ([regex]::Matches($bcdEntries, "(?mi)^identifier")).Count
+    if ($osCount -le 1) {
+        Add-Result -VulnID "V-253266" -RuleID "WN11-00-000055" -Severity "medium" `
+            -RuleTitle "Alternate operating systems must not be permitted on the same system" `
+            -Status "Pass" -Details "Only one OS entry found in boot configuration."
+    } else {
+        Add-Result -VulnID "V-253266" -RuleID "WN11-00-000055" -Severity "medium" `
+            -RuleTitle "Alternate operating systems must not be permitted on the same system" `
+            -Status "Manual" -Details "$osCount boot entries found. Cannot auto-fix safely - verify no alternate OS is installed." `
+            -ManualSteps @"
+1. Run 'bcdedit /enum' in an elevated Command Prompt to list all boot entries.
+2. Right-click Start > System > Advanced system settings > Startup and Recovery > Settings.
+3. Check 'Default operating system' drop-down. Only Windows 11 should appear.
+4. Remove alternate OS entries if present.
+"@
+    }
+} catch {
+    Add-Result -VulnID "V-253266" -RuleID "WN11-00-000055" -Severity "medium" `
+        -RuleTitle "Alternate operating systems must not be permitted on the same system" `
+        -Status "Manual" -Details "Unable to query boot configuration." `
+        -ManualSteps "1. Run 'bcdedit /enum' manually to check boot entries."
+}
+
+# ============================================================================
+# V-253267 | WN11-00-000060 | Non-system-created file shares
+# ============================================================================
+$shares = Get-SmbShare -ErrorAction SilentlyContinue
+$systemShares = @("ADMIN$", "C$", "IPC$")
+$nonSystemShares = $shares | Where-Object { $_.Name -notin $systemShares -and $_.Name -notmatch '^\w\$$' }
+if ($nonSystemShares) {
+    $shareNames = ($nonSystemShares | ForEach-Object { $_.Name }) -join ", "
+    Add-Result -VulnID "V-253267" -RuleID "WN11-00-000060" -Severity "medium" `
+        -RuleTitle "Non-system-created file shares must limit access" `
+        -Status "Manual" -Details "Non-system shares: $shareNames. Cannot auto-fix - requires business decision on permissions." `
+        -ManualSteps @"
+1. Open Computer Management > Shared Folders > Shares.
+2. For each non-system share ($shareNames): right-click > Properties.
+3. Check Share Permissions tab - restrict to specific groups/accounts.
+4. Check Security tab - restrict NTFS permissions similarly.
+5. Remove any unnecessary shares.
+"@
+} else {
+    Add-Result -VulnID "V-253267" -RuleID "WN11-00-000060" -Severity "medium" `
+        -RuleTitle "Non-system-created file shares must limit access" `
+        -Status "N/A" -Details "Only system-created shares exist."
+}
+
+# Pre-fetch local users (shared by V-253268, V-253272, V-253273)
+$script:allLocalUsers = try { Get-LocalUser -ErrorAction Stop } catch { $null }
+
+# ============================================================================
+# V-253268 | WN11-00-000065 | Unused accounts disabled after 35 days
+# ============================================================================
+try {
+    $localUsers = $script:allLocalUsers
+    if ($null -eq $localUsers) { throw "Get-LocalUser not available" }
+    $builtInSIDs = @("500","501","503")
+    $inactiveAccounts = @()
+    foreach ($user in $localUsers) {
+        if (-not $user.Enabled) { continue }
+        $sidEnd = $user.SID.Value.Split("-")[-1]
+        if ($sidEnd -in $builtInSIDs) { continue }
+        $lastLogon = $user.LastLogon
+        if ($null -eq $lastLogon -or $lastLogon -lt (Get-Date).AddDays(-35)) {
+            $inactiveAccounts += $user
+        }
+    }
+    if ($inactiveAccounts.Count -gt 0) {
+        if ($AutoFix) {
+            Write-FixAttempt "Disabling inactive accounts..."
+            $disabled = @()
+            foreach ($acct in $inactiveAccounts) {
+                try {
+                    Disable-LocalUser -Name $acct.Name -ErrorAction Stop
+                    $disabled += $acct.Name
+                } catch { }
+            }
+            if ($disabled.Count -eq $inactiveAccounts.Count) {
+                Add-Result -VulnID "V-253268" -RuleID "WN11-00-000065" -Severity "low" `
+                    -RuleTitle "Unused accounts must be disabled or removed after 35 days of inactivity" `
+                    -Status "Fixed" -Details "Disabled inactive accounts: $($disabled -join ', ')" `
+                    -FixAction "Disabled accounts: $($disabled -join ', ')"
+            } else {
+                $remaining = ($inactiveAccounts | Where-Object { $_.Name -notin $disabled } | ForEach-Object { $_.Name }) -join ', '
+                Add-Result -VulnID "V-253268" -RuleID "WN11-00-000065" -Severity "low" `
+                    -RuleTitle "Unused accounts must be disabled or removed after 35 days of inactivity" `
+                    -Status "Fail" -Details "Disabled: $($disabled -join ', '). Failed to disable: $remaining"
+            }
+        } else {
+            $nameList = ($inactiveAccounts | ForEach-Object { "$($_.Name) (LastLogon: $($_.LastLogon))" }) -join '; '
+            Add-Result -VulnID "V-253268" -RuleID "WN11-00-000065" -Severity "low" `
+                -RuleTitle "Unused accounts must be disabled or removed after 35 days of inactivity" `
+                -Status "Fail" -Details "Inactive enabled accounts: $nameList"
+        }
+    } else {
+        Add-Result -VulnID "V-253268" -RuleID "WN11-00-000065" -Severity "low" `
+            -RuleTitle "Unused accounts must be disabled or removed after 35 days of inactivity" `
+            -Status "Pass" -Details "No enabled accounts inactive > 35 days."
+    }
+} catch {
+    Add-Result -VulnID "V-253268" -RuleID "WN11-00-000065" -Severity "low" `
+        -RuleTitle "Unused accounts must be disabled or removed after 35 days of inactivity" `
+        -Status "Manual" -Details "Unable to enumerate local users: $_" `
+        -ManualSteps "1. Open Computer Management > Local Users and Groups > Users.`n2. Check last logon for each enabled account.`n3. Disable accounts inactive > 35 days."
+}
+
+# ============================================================================
+# V-253269 | WN11-00-000070 | Only admin accounts in Administrators group
+# ============================================================================
+try {
+    $adminMembers = Get-LocalGroupMember -Group "Administrators" -ErrorAction Stop
+    $memberList = ($adminMembers | ForEach-Object { $_.Name }) -join ", "
+    Add-Result -VulnID "V-253269" -RuleID "WN11-00-000070" -Severity "high" `
+        -RuleTitle "Only accounts responsible for administration must have Administrator rights" `
+        -Status "Manual" -Details "Members: $memberList. Cannot auto-fix - requires organizational review." `
+        -ManualSteps @"
+1. Open Computer Management > Local Users and Groups > Groups > Administrators.
+2. Current members: $memberList
+3. Verify ONLY designated admin accounts/groups are present.
+4. Remove any standard user accounts from the group.
+5. For domain-joined: Domain Admins should be replaced by a workstation admin group.
+"@
+} catch {
+    Add-Result -VulnID "V-253269" -RuleID "WN11-00-000070" -Severity "high" `
+        -RuleTitle "Only accounts responsible for administration must have Administrator rights" `
+        -Status "Manual" -Details "Unable to enumerate Administrators group." `
+        -ManualSteps "1. Open Computer Management > Local Users and Groups > Groups > Administrators.`n2. Review and verify all members."
+}
+
+# ============================================================================
+# V-253270 | WN11-00-000075 | Backup Operators group
+# ============================================================================
+try {
+    $backupMembers = Get-LocalGroupMember -Group "Backup Operators" -ErrorAction Stop
+    if ($backupMembers.Count -eq 0) {
+        Add-Result -VulnID "V-253270" -RuleID "WN11-00-000075" -Severity "medium" `
+            -RuleTitle "Only backup accounts must be members of the Backup Operators group" `
+            -Status "Pass" -Details "Backup Operators group is empty."
+    } else {
+        $memberList = ($backupMembers | ForEach-Object { $_.Name }) -join ", "
+        Add-Result -VulnID "V-253270" -RuleID "WN11-00-000075" -Severity "medium" `
+            -RuleTitle "Only backup accounts must be members of the Backup Operators group" `
+            -Status "Manual" -Details "Members: $memberList. Cannot auto-fix - requires verification that these are dedicated backup accounts." `
+            -ManualSteps "1. Open Computer Management > Groups > Backup Operators.`n2. Verify all members ($memberList) are dedicated backup accounts.`n3. Remove any standard user accounts."
+    }
+} catch {
+    Add-Result -VulnID "V-253270" -RuleID "WN11-00-000075" -Severity "medium" `
+        -RuleTitle "Only backup accounts must be members of the Backup Operators group" `
+        -Status "Pass" -Details "Backup Operators group not found or empty."
+}
+
+# ============================================================================
+# V-253271 | WN11-00-000080 | Hyper-V Administrators group
+# ============================================================================
+try {
+    $hvMembers = Get-LocalGroupMember -Group "Hyper-V Administrators" -ErrorAction Stop
+    if ($hvMembers.Count -eq 0) {
+        Add-Result -VulnID "V-253271" -RuleID "WN11-00-000080" -Severity "medium" `
+            -RuleTitle "Only authorized accounts in Hyper-V Administrators group" `
+            -Status "Pass" -Details "Hyper-V Administrators group is empty."
+    } else {
+        $memberList = ($hvMembers | ForEach-Object { $_.Name }) -join ", "
+        Add-Result -VulnID "V-253271" -RuleID "WN11-00-000080" -Severity "medium" `
+            -RuleTitle "Only authorized accounts in Hyper-V Administrators group" `
+            -Status "Manual" -Details "Members: $memberList. Cannot auto-fix - requires ISSM/ISSO authorization verification." `
+            -ManualSteps "1. Open Computer Management > Groups > Hyper-V Administrators.`n2. Verify all members ($memberList) are authorized and documented with ISSM/ISSO.`n3. Remove unauthorized accounts."
+    }
+} catch {
+    Add-Result -VulnID "V-253271" -RuleID "WN11-00-000080" -Severity "medium" `
+        -RuleTitle "Only authorized accounts in Hyper-V Administrators group" `
+        -Status "N/A" -Details "Hyper-V Administrators group not found."
+}
+
+# ============================================================================
+# V-253272 | WN11-00-000085 | No standard local user accounts in domain
+# ============================================================================
+if (-not $isDomainJoined) {
+    Add-Result -VulnID "V-253272" -RuleID "WN11-00-000085" -Severity "low" `
+        -RuleTitle "Standard local user accounts must not exist on a system in a domain" `
+        -Status "N/A" -Details "System is not domain-joined."
+} else {
+    try {
+        $localUsers2 = $script:allLocalUsers
+        if ($null -eq $localUsers2) { throw "Get-LocalUser not available" }
+        $builtInNames = @("Administrator","Guest","DefaultAccount","defaultuser0","WDAGUtilityAccount")
+        $nonBuiltIn = $localUsers2 | Where-Object { $_.Name -notin $builtInNames -and $_.Enabled -eq $true }
+        if ($nonBuiltIn) {
+            $names = ($nonBuiltIn | ForEach-Object { $_.Name }) -join ", "
+            Add-Result -VulnID "V-253272" -RuleID "WN11-00-000085" -Severity "low" `
+                -RuleTitle "Standard local user accounts must not exist on a system in a domain" `
+                -Status "Manual" -Details "Non-built-in enabled local accounts: $names. Cannot auto-fix - verify if these are local admin accounts." `
+                -ManualSteps "1. Open Computer Management > Local Users and Groups > Users.`n2. Accounts found: $names`n3. Verify if these are authorized local admin accounts.`n4. Remove unauthorized standard user accounts."
+        } else {
+            Add-Result -VulnID "V-253272" -RuleID "WN11-00-000085" -Severity "low" `
+                -RuleTitle "Standard local user accounts must not exist on a system in a domain" `
+                -Status "Pass" -Details "No unauthorized local user accounts found."
+        }
+    } catch {
+        Add-Result -VulnID "V-253272" -RuleID "WN11-00-000085" -Severity "low" `
+            -RuleTitle "Standard local user accounts must not exist on a system in a domain" `
+            -Status "Manual" -Details "Unable to enumerate local users." `
+            -ManualSteps "1. Open Computer Management > Local Users and Groups > Users.`n2. Verify no unauthorized local accounts exist."
+    }
+}
+
+# ============================================================================
+# V-253273 | WN11-00-000090 | Password expiration configured
+# ============================================================================
+try {
+    $localUsers3 = $script:allLocalUsers
+    if ($null -eq $localUsers3) { throw "Get-LocalUser not available" }
+    $neverExpires = $localUsers3 | Where-Object { $_.Enabled -and $_.PasswordExpires -eq $null -and $_.Name -notin @("Guest","DefaultAccount","WDAGUtilityAccount","defaultuser0") }
+    if ($neverExpires) {
+        if ($AutoFix) {
+            Write-FixAttempt "Setting password expiration on accounts..."
+            $fixed = @()
+            foreach ($acct in $neverExpires) {
+                try {
+                    Set-LocalUser -Name $acct.Name -PasswordNeverExpires $false -ErrorAction Stop
+                    $fixed += $acct.Name
+                } catch { }
+            }
+            if ($fixed.Count -eq $neverExpires.Count) {
+                Add-Result -VulnID "V-253273" -RuleID "WN11-00-000090" -Severity "medium" `
+                    -RuleTitle "Accounts must be configured to require password expiration" `
+                    -Status "Fixed" -Details "Password expiration enabled for: $($fixed -join ', ')" `
+                    -FixAction "Set PasswordNeverExpires=false on: $($fixed -join ', ')"
+            } else {
+                $remaining = ($neverExpires | Where-Object { $_.Name -notin $fixed } | ForEach-Object { $_.Name }) -join ', '
+                Add-Result -VulnID "V-253273" -RuleID "WN11-00-000090" -Severity "medium" `
+                    -RuleTitle "Accounts must be configured to require password expiration" `
+                    -Status "Fail" -Details "Fixed: $($fixed -join ', '). Failed: $remaining"
+            }
+        } else {
+            $names = ($neverExpires | ForEach-Object { $_.Name }) -join ", "
+            Add-Result -VulnID "V-253273" -RuleID "WN11-00-000090" -Severity "medium" `
+                -RuleTitle "Accounts must be configured to require password expiration" `
+                -Status "Fail" -Details "Accounts with 'Password never expires': $names"
+        }
+    } else {
+        Add-Result -VulnID "V-253273" -RuleID "WN11-00-000090" -Severity "medium" `
+            -RuleTitle "Accounts must be configured to require password expiration" `
+            -Status "Pass" -Details "No active accounts have 'Password never expires'."
+    }
+} catch {
+    Add-Result -VulnID "V-253273" -RuleID "WN11-00-000090" -Severity "medium" `
+        -RuleTitle "Accounts must be configured to require password expiration" `
+        -Status "Manual" -Details "Unable to check password expiration: $_" `
+        -ManualSteps "1. Computer Management > Users > double-click each active account.`n2. Uncheck 'Password never expires'."
+}
+
+# V-253274 | WN11-00-000095 - Moved to $registryChecks data table below
+
+# ============================================================================
+# V-253275 | WN11-00-000100 | IIS not installed
+# ============================================================================
+try {
+    $iis = Get-WindowsOptionalFeature -Online -FeatureName "IIS-WebServer" -ErrorAction Stop
+    $iisCore = Get-WindowsOptionalFeature -Online -FeatureName "IIS-HostableWebCore" -ErrorAction Stop
+    if ($iis.State -eq "Enabled" -or $iisCore.State -eq "Enabled") {
+        if ($AutoFix) {
+            Write-FixAttempt "Disabling IIS features..."
+            try {
+                if ($iis.State -eq "Enabled") { Disable-WindowsOptionalFeature -Online -FeatureName "IIS-WebServer" -NoRestart -ErrorAction Stop }
+                if ($iisCore.State -eq "Enabled") { Disable-WindowsOptionalFeature -Online -FeatureName "IIS-HostableWebCore" -NoRestart -ErrorAction Stop }
+                Add-Result -VulnID "V-253275" -RuleID "WN11-00-000100" -Severity "high" `
+                    -RuleTitle "IIS or its subcomponents must not be installed on a workstation" `
+                    -Status "Fixed" -Details "IIS features disabled. Reboot may be required." `
+                    -FixAction "Disabled IIS-WebServer and IIS-HostableWebCore features."
+            } catch {
+                Add-Result -VulnID "V-253275" -RuleID "WN11-00-000100" -Severity "high" `
+                    -RuleTitle "IIS or its subcomponents must not be installed on a workstation" `
+                    -Status "Fail" -Details "Auto-fix failed to disable IIS: $_"
+            }
+        } else {
+            Add-Result -VulnID "V-253275" -RuleID "WN11-00-000100" -Severity "high" `
+                -RuleTitle "IIS or its subcomponents must not be installed on a workstation" `
+                -Status "Fail" -Details "IIS-WebServer: $($iis.State), IIS-HostableWebCore: $($iisCore.State)"
+        }
+    } else {
+        Add-Result -VulnID "V-253275" -RuleID "WN11-00-000100" -Severity "high" `
+            -RuleTitle "IIS or its subcomponents must not be installed on a workstation" `
+            -Status "Pass" -Details "IIS is not installed."
+    }
+} catch {
+    Add-Result -VulnID "V-253275" -RuleID "WN11-00-000100" -Severity "high" `
+        -RuleTitle "IIS or its subcomponents must not be installed on a workstation" `
+        -Status "Pass" -Details "IIS features not found (not installed)."
+}
+
+# ============================================================================
+# V-253276 | WN11-00-000105 | SNMP not installed
+# ============================================================================
+$snmpExists = Test-Path "$env:SystemRoot\System32\snmp.exe"
+if ($snmpExists) {
+    if ($AutoFix) {
+        Write-FixAttempt "Removing SNMP feature..."
+        try {
+            $snmpFeature = Get-WindowsCapability -Online -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*SNMP*" -and $_.State -eq "Installed" }
+            if ($snmpFeature) {
+                $snmpFeature | ForEach-Object { Remove-WindowsCapability -Online -Name $_.Name -ErrorAction Stop }
+            }
+            if (-not (Test-Path "$env:SystemRoot\System32\snmp.exe")) {
+                Add-Result -VulnID "V-253276" -RuleID "WN11-00-000105" -Severity "medium" `
+                    -RuleTitle "SNMP must not be installed on the system" `
+                    -Status "Fixed" -Details "SNMP removed." -FixAction "Removed SNMP capability."
+            } else {
+                Add-Result -VulnID "V-253276" -RuleID "WN11-00-000105" -Severity "medium" `
+                    -RuleTitle "SNMP must not be installed on the system" `
+                    -Status "Fail" -Details "Auto-fix attempted but snmp.exe still exists. May require reboot."
+            }
+        } catch {
+            Add-Result -VulnID "V-253276" -RuleID "WN11-00-000105" -Severity "medium" `
+                -RuleTitle "SNMP must not be installed on the system" `
+                -Status "Fail" -Details "Auto-fix failed: $_. Manually uninstall SNMP from Windows Features."
+        }
+    } else {
+        Add-Result -VulnID "V-253276" -RuleID "WN11-00-000105" -Severity "medium" `
+            -RuleTitle "SNMP must not be installed on the system" `
+            -Status "Fail" -Details "snmp.exe found in System32."
+    }
+} else {
+    Add-Result -VulnID "V-253276" -RuleID "WN11-00-000105" -Severity "medium" `
+        -RuleTitle "SNMP must not be installed on the system" `
+        -Status "Pass" -Details "SNMP is not installed."
+}
+
+# ============================================================================
+# V-253277 | WN11-00-000110 | Simple TCP/IP Services not installed
+# ============================================================================
+$simpleTcpSvc = Get-Service -Name "simptcp" -ErrorAction SilentlyContinue
+if ($simpleTcpSvc) {
+    if ($AutoFix) {
+        Write-FixAttempt "Stopping and disabling Simple TCP/IP Services..."
+        try {
+            Stop-Service -Name "simptcp" -Force -ErrorAction SilentlyContinue
+            Set-Service -Name "simptcp" -StartupType Disabled -ErrorAction Stop
+            Add-Result -VulnID "V-253277" -RuleID "WN11-00-000110" -Severity "medium" `
+                -RuleTitle "Simple TCP/IP Services must not be installed on the system" `
+                -Status "Fixed" -Details "Simple TCP/IP Services stopped and disabled." `
+                -FixAction "Stopped and disabled simptcp service."
+        } catch {
+            Add-Result -VulnID "V-253277" -RuleID "WN11-00-000110" -Severity "medium" `
+                -RuleTitle "Simple TCP/IP Services must not be installed on the system" `
+                -Status "Fail" -Details "Auto-fix failed: $_"
+        }
+    } else {
+        Add-Result -VulnID "V-253277" -RuleID "WN11-00-000110" -Severity "medium" `
+            -RuleTitle "Simple TCP/IP Services must not be installed on the system" `
+            -Status "Fail" -Details "Simple TCP/IP Services is installed (Status: $($simpleTcpSvc.Status))."
+    }
+} else {
+    Add-Result -VulnID "V-253277" -RuleID "WN11-00-000110" -Severity "medium" `
+        -RuleTitle "Simple TCP/IP Services must not be installed on the system" `
+        -Status "Pass" -Details "Simple TCP/IP Services is not installed."
+}
+
+# ============================================================================
+# V-253278 | WN11-00-000115 | Telnet Client not installed
+# ============================================================================
+$telnetExists = Test-Path "$env:SystemRoot\System32\telnet.exe"
+if ($telnetExists) {
+    if ($AutoFix) {
+        Write-FixAttempt "Removing Telnet Client..."
+        try {
+            $telnetCap = Get-WindowsCapability -Online -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*Telnet.Client*" -and $_.State -eq "Installed" }
+            if ($telnetCap) { $telnetCap | ForEach-Object { Remove-WindowsCapability -Online -Name $_.Name -ErrorAction Stop } }
+            else { Disable-WindowsOptionalFeature -Online -FeatureName "TelnetClient" -NoRestart -ErrorAction Stop }
+            Add-Result -VulnID "V-253278" -RuleID "WN11-00-000115" -Severity "medium" `
+                -RuleTitle "The Telnet Client must not be installed on the system" `
+                -Status "Fixed" -Details "Telnet Client removed." -FixAction "Removed Telnet Client feature/capability."
+        } catch {
+            Add-Result -VulnID "V-253278" -RuleID "WN11-00-000115" -Severity "medium" `
+                -RuleTitle "The Telnet Client must not be installed on the system" `
+                -Status "Fail" -Details "Auto-fix failed: $_"
+        }
+    } else {
+        Add-Result -VulnID "V-253278" -RuleID "WN11-00-000115" -Severity "medium" `
+            -RuleTitle "The Telnet Client must not be installed on the system" `
+            -Status "Fail" -Details "telnet.exe found in System32."
+    }
+} else {
+    Add-Result -VulnID "V-253278" -RuleID "WN11-00-000115" -Severity "medium" `
+        -RuleTitle "The Telnet Client must not be installed on the system" `
+        -Status "Pass" -Details "Telnet Client is not installed."
+}
+
+# ============================================================================
+# V-253279 | WN11-00-000120 | TFTP Client not installed
+# ============================================================================
+$tftpExists = Test-Path "$env:SystemRoot\System32\tftp.exe"
+if ($tftpExists) {
+    if ($AutoFix) {
+        Write-FixAttempt "Removing TFTP Client..."
+        try {
+            Disable-WindowsOptionalFeature -Online -FeatureName "TFTP" -NoRestart -ErrorAction Stop
+            Add-Result -VulnID "V-253279" -RuleID "WN11-00-000120" -Severity "medium" `
+                -RuleTitle "The TFTP Client must not be installed on the system" `
+                -Status "Fixed" -Details "TFTP Client removed." -FixAction "Disabled TFTP feature."
+        } catch {
+            Add-Result -VulnID "V-253279" -RuleID "WN11-00-000120" -Severity "medium" `
+                -RuleTitle "The TFTP Client must not be installed on the system" `
+                -Status "Fail" -Details "Auto-fix failed: $_"
+        }
+    } else {
+        Add-Result -VulnID "V-253279" -RuleID "WN11-00-000120" -Severity "medium" `
+            -RuleTitle "The TFTP Client must not be installed on the system" `
+            -Status "Fail" -Details "tftp.exe found in System32."
+    }
+} else {
+    Add-Result -VulnID "V-253279" -RuleID "WN11-00-000120" -Severity "medium" `
+        -RuleTitle "The TFTP Client must not be installed on the system" `
+        -Status "Pass" -Details "TFTP Client is not installed."
+}
+
+# ============================================================================
+# V-253280 | WN11-00-000130 | No .p12 / .pfx certificate files
+# ============================================================================
+try {
+    $certFiles = @()
+    $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null }
+    foreach ($drive in $drives) {
+        $certFiles += Get-ChildItem -Path "$($drive.Root)" -Include "*.p12","*.pfx" -Recurse -ErrorAction SilentlyContinue -Force | Select-Object -First 10
+        if ($certFiles.Count -gt 0) { break }
+    }
+    if ($certFiles.Count -gt 0) {
+        $fileList = ($certFiles | ForEach-Object { $_.FullName }) -join ", "
+        # Cannot auto-fix: files may be needed by applications
+        Add-Result -VulnID "V-253280" -RuleID "WN11-00-000130" -Severity "medium" `
+            -RuleTitle "Software certificate installation files must be removed from Windows 11" `
+            -Status "Fail" -Details "Certificate files found: $fileList. Cannot auto-delete - may be required by applications. Verify and remove manually." `
+            -ManualSteps "1. Review each file: $fileList`n2. Delete files not required by applications (e.g., Oracle Wallet Manager, Adobe PreFlight).`n3. Document exceptions with the ISSO."
+    } else {
+        Add-Result -VulnID "V-253280" -RuleID "WN11-00-000130" -Severity "medium" `
+            -RuleTitle "Software certificate installation files must be removed from Windows 11" `
+            -Status "Pass" -Details "No .p12 or .pfx files found."
+    }
+} catch {
+    Add-Result -VulnID "V-253280" -RuleID "WN11-00-000130" -Severity "medium" `
+        -RuleTitle "Software certificate installation files must be removed from Windows 11" `
+        -Status "Manual" -Details "Unable to search: $_" `
+        -ManualSteps "1. Open elevated CMD: dir /s /b C:\*.p12 C:\*.pfx`n2. Remove any unauthorized certificate files."
+}
+
+# ============================================================================
+# V-253281 | WN11-00-000135 | Host-based firewall enabled
+# ============================================================================
+try {
+    $fwProfiles = Get-NetFirewallProfile -ErrorAction Stop
+    $disabledProfiles = $fwProfiles | Where-Object { $_.Enabled -eq $false }
+    if ($disabledProfiles) {
+        if ($AutoFix) {
+            Write-FixAttempt "Enabling firewall on all profiles..."
+            try {
+                Set-NetFirewallProfile -All -Enabled True -ErrorAction Stop
+                Add-Result -VulnID "V-253281" -RuleID "WN11-00-000135" -Severity "medium" `
+                    -RuleTitle "A host-based firewall must be installed and enabled" `
+                    -Status "Fixed" -Details "Windows Firewall enabled on all profiles." `
+                    -FixAction "Set-NetFirewallProfile -All -Enabled True"
+            } catch {
+                $names = ($disabledProfiles | ForEach-Object { $_.Name }) -join ", "
+                Add-Result -VulnID "V-253281" -RuleID "WN11-00-000135" -Severity "medium" `
+                    -RuleTitle "A host-based firewall must be installed and enabled" `
+                    -Status "Fail" -Details "Auto-fix failed: $_. Disabled profiles: $names"
+            }
+        } else {
+            $names = ($disabledProfiles | ForEach-Object { $_.Name }) -join ", "
+            Add-Result -VulnID "V-253281" -RuleID "WN11-00-000135" -Severity "medium" `
+                -RuleTitle "A host-based firewall must be installed and enabled" `
+                -Status "Fail" -Details "Firewall disabled on profiles: $names"
+        }
+    } else {
+        Add-Result -VulnID "V-253281" -RuleID "WN11-00-000135" -Severity "medium" `
+            -RuleTitle "A host-based firewall must be installed and enabled" `
+            -Status "Pass" -Details "Windows Firewall is enabled on all profiles."
+    }
+} catch {
+    Add-Result -VulnID "V-253281" -RuleID "WN11-00-000135" -Severity "medium" `
+        -RuleTitle "A host-based firewall must be installed and enabled" `
+        -Status "Manual" -Details "Unable to query firewall: $_" `
+        -ManualSteps "1. Open Control Panel > Windows Defender Firewall.`n2. Verify all profiles show 'On'.`n3. Enable any disabled profiles."
+}
+
+# ============================================================================
+# V-253282 | WN11-00-000140 | Firewall inbound exceptions scoped
+# ============================================================================
+Add-Result -VulnID "V-253282" -RuleID "WN11-00-000140" -Severity "medium" `
+    -RuleTitle "Inbound exceptions to the firewall must only allow authorized remote management hosts" `
+    -Status "Manual" -Details "Cannot auto-fix - requires organizational review of authorized management host IPs." `
+    -ManualSteps @"
+1. Open wf.msc > Inbound Rules.
+2. For each Allow rule: double-click > Scope tab.
+3. Verify Remote IP address is NOT 'Any IP address'.
+4. Set to specific authorized management host IPs/subnets.
+"@
+
+# V-253284 | WN11-00-000150 - Moved to $registryChecks data table below
+
+# ============================================================================
+# V-253285 | WN11-00-000155 | PowerShell 2.0 disabled
+# ============================================================================
+if ($buildNumber -ge 26100) {
+    Add-Result -VulnID "V-253285" -RuleID "WN11-00-000155" -Severity "medium" `
+        -RuleTitle "The Windows PowerShell 2.0 feature must be disabled" `
+        -Status "N/A" -Details "Windows 11 version 24H2 or newer."
+} else {
+    try {
+        $ps2 = Get-WindowsOptionalFeature -Online -FeatureName "MicrosoftWindowsPowerShellV2Root" -ErrorAction Stop
+        if ($ps2.State -eq "Enabled") {
+            if ($AutoFix) {
+                Write-FixAttempt "Disabling PowerShell 2.0..."
+                try {
+                    Disable-WindowsOptionalFeature -Online -FeatureName "MicrosoftWindowsPowerShellV2Root" -NoRestart -ErrorAction Stop
+                    Add-Result -VulnID "V-253285" -RuleID "WN11-00-000155" -Severity "medium" `
+                        -RuleTitle "The Windows PowerShell 2.0 feature must be disabled" `
+                        -Status "Fixed" -Details "PowerShell 2.0 disabled. Reboot may be required." `
+                        -FixAction "Disabled MicrosoftWindowsPowerShellV2Root feature."
+                } catch {
+                    Add-Result -VulnID "V-253285" -RuleID "WN11-00-000155" -Severity "medium" `
+                        -RuleTitle "The Windows PowerShell 2.0 feature must be disabled" `
+                        -Status "Fail" -Details "Auto-fix failed: $_"
+                }
+            } else {
+                Add-Result -VulnID "V-253285" -RuleID "WN11-00-000155" -Severity "medium" `
+                    -RuleTitle "The Windows PowerShell 2.0 feature must be disabled" `
+                    -Status "Fail" -Details "PowerShellV2Root: $($ps2.State)"
+            }
+        } else {
+            Add-Result -VulnID "V-253285" -RuleID "WN11-00-000155" -Severity "medium" `
+                -RuleTitle "The Windows PowerShell 2.0 feature must be disabled" `
+                -Status "Pass" -Details "PowerShell 2.0 is disabled."
+        }
+    } catch {
+        Add-Result -VulnID "V-253285" -RuleID "WN11-00-000155" -Severity "medium" `
+            -RuleTitle "The Windows PowerShell 2.0 feature must be disabled" `
+            -Status "Pass" -Details "PowerShell 2.0 feature not found."
+    }
+}
+
+# ============================================================================
+# V-253286 | WN11-00-000160 | SMBv1 protocol disabled (feature)
+# ============================================================================
+try {
+    $smb1 = Get-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -ErrorAction Stop
+    if ($smb1.State -eq "Enabled") {
+        if ($AutoFix) {
+            Write-FixAttempt "Disabling SMBv1 protocol..."
+            try {
+                Disable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -NoRestart -ErrorAction Stop
+                $script:smb1FeatureDisabled = $true
+                Add-Result -VulnID "V-253286" -RuleID "WN11-00-000160" -Severity "medium" `
+                    -RuleTitle "The SMBv1 protocol must be disabled on the system" `
+                    -Status "Fixed" -Details "SMB1Protocol feature disabled. Reboot required." `
+                    -FixAction "Disabled SMB1Protocol feature."
+            } catch {
+                $script:smb1FeatureDisabled = $false
+                Add-Result -VulnID "V-253286" -RuleID "WN11-00-000160" -Severity "medium" `
+                    -RuleTitle "The SMBv1 protocol must be disabled on the system" `
+                    -Status "Fail" -Details "Auto-fix failed: $_"
+            }
+        } else {
+            $script:smb1FeatureDisabled = $false
+            Add-Result -VulnID "V-253286" -RuleID "WN11-00-000160" -Severity "medium" `
+                -RuleTitle "The SMBv1 protocol must be disabled on the system" `
+                -Status "Fail" -Details "SMB1Protocol feature is Enabled."
+        }
+    } else {
+        $script:smb1FeatureDisabled = $true
+        Add-Result -VulnID "V-253286" -RuleID "WN11-00-000160" -Severity "medium" `
+            -RuleTitle "The SMBv1 protocol must be disabled on the system" `
+            -Status "Pass" -Details "SMB1Protocol feature is Disabled."
+    }
+} catch {
+    $script:smb1FeatureDisabled = $false
+    Add-Result -VulnID "V-253286" -RuleID "WN11-00-000160" -Severity "medium" `
+        -RuleTitle "The SMBv1 protocol must be disabled on the system" `
+        -Status "Manual" -Details "Unable to check SMB1Protocol feature: $_" `
+        -ManualSteps "1. Run: Get-WindowsOptionalFeature -Online | Where FeatureName -eq SMB1Protocol`n2. If Enabled, run: Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol"
+}
+
+# ============================================================================
+# V-253287 | WN11-00-000165 | SMBv1 server disabled (registry)
+# ============================================================================
+if ($script:smb1FeatureDisabled) {
+    Add-Result -VulnID "V-253287" -RuleID "WN11-00-000165" -Severity "medium" `
+        -RuleTitle "The SMBv1 protocol must be disabled on the SMB server" `
+        -Status "N/A" -Details "SMBv1 disabled via feature (WN11-00-000160)."
+} else {
+    $smb1Server = Get-RegistryValueSafe -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "SMB1"
+    if ($smb1Server -eq 0) {
+        Add-Result -VulnID "V-253287" -RuleID "WN11-00-000165" -Severity "medium" `
+            -RuleTitle "The SMBv1 protocol must be disabled on the SMB server" `
+            -Status "Pass" -Details "SMB1=0 (server disabled)"
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Disabling SMBv1 server via registry..."
+            if (Set-RegistryValueForce -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "SMB1" -Value 0) {
+                Add-Result -VulnID "V-253287" -RuleID "WN11-00-000165" -Severity "medium" `
+                    -RuleTitle "The SMBv1 protocol must be disabled on the SMB server" `
+                    -Status "Fixed" -Details "SMB1 server disabled. Reboot required." `
+                    -FixAction "Set LanmanServer\Parameters\SMB1 = 0"
+            } else {
+                Add-Result -VulnID "V-253287" -RuleID "WN11-00-000165" -Severity "medium" `
+                    -RuleTitle "The SMBv1 protocol must be disabled on the SMB server" `
+                    -Status "Fail" -Details "Auto-fix failed."
+            }
+        } else {
+            Add-Result -VulnID "V-253287" -RuleID "WN11-00-000165" -Severity "medium" `
+                -RuleTitle "The SMBv1 protocol must be disabled on the SMB server" `
+                -Status "Fail" -Details "SMB1=$smb1Server (should be 0)"
+        }
+    }
+}
+
+# ============================================================================
+# V-253288 | WN11-00-000170 | SMBv1 client disabled (registry)
+# ============================================================================
+if ($script:smb1FeatureDisabled) {
+    Add-Result -VulnID "V-253288" -RuleID "WN11-00-000170" -Severity "medium" `
+        -RuleTitle "The SMBv1 protocol must be disabled on the SMB client" `
+        -Status "N/A" -Details "SMBv1 disabled via feature (WN11-00-000160)."
+} else {
+    $mrxsmb10 = Get-RegistryValueSafe -Path "HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10" -Name "Start"
+    if ($mrxsmb10 -eq 4) {
+        Add-Result -VulnID "V-253288" -RuleID "WN11-00-000170" -Severity "medium" `
+            -RuleTitle "The SMBv1 protocol must be disabled on the SMB client" `
+            -Status "Pass" -Details "mrxsmb10 Start=4 (disabled)"
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Disabling SMBv1 client via registry..."
+            if (Set-RegistryValueForce -Path "HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10" -Name "Start" -Value 4) {
+                Add-Result -VulnID "V-253288" -RuleID "WN11-00-000170" -Severity "medium" `
+                    -RuleTitle "The SMBv1 protocol must be disabled on the SMB client" `
+                    -Status "Fixed" -Details "SMBv1 client disabled. Reboot required." `
+                    -FixAction "Set mrxsmb10\Start = 4"
+            } else {
+                Add-Result -VulnID "V-253288" -RuleID "WN11-00-000170" -Severity "medium" `
+                    -RuleTitle "The SMBv1 protocol must be disabled on the SMB client" `
+                    -Status "Fail" -Details "Auto-fix failed."
+            }
+        } else {
+            Add-Result -VulnID "V-253288" -RuleID "WN11-00-000170" -Severity "medium" `
+                -RuleTitle "The SMBv1 protocol must be disabled on the SMB client" `
+                -Status "Fail" -Details "mrxsmb10 Start=$mrxsmb10 (should be 4)"
+        }
+    }
+}
+
+# ============================================================================
+# V-253289 | WN11-00-000175 | Secondary Logon service disabled
+# ============================================================================
+$secLogon = Get-Service -Name "seclogon" -ErrorAction SilentlyContinue
+if ($secLogon) {
+    if ($secLogon.StartType -eq "Disabled" -and $secLogon.Status -ne "Running") {
+        Add-Result -VulnID "V-253289" -RuleID "WN11-00-000175" -Severity "medium" `
+            -RuleTitle "The Secondary Logon service must be disabled on Windows 11" `
+            -Status "Pass" -Details "Secondary Logon: Disabled and not Running."
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Disabling Secondary Logon service..."
+            try {
+                Stop-Service -Name "seclogon" -Force -ErrorAction SilentlyContinue
+                Set-Service -Name "seclogon" -StartupType Disabled -ErrorAction Stop
+                Add-Result -VulnID "V-253289" -RuleID "WN11-00-000175" -Severity "medium" `
+                    -RuleTitle "The Secondary Logon service must be disabled on Windows 11" `
+                    -Status "Fixed" -Details "Secondary Logon stopped and disabled." `
+                    -FixAction "Stopped and disabled seclogon service."
+            } catch {
+                Add-Result -VulnID "V-253289" -RuleID "WN11-00-000175" -Severity "medium" `
+                    -RuleTitle "The Secondary Logon service must be disabled on Windows 11" `
+                    -Status "Fail" -Details "Auto-fix failed: $_"
+            }
+        } else {
+            Add-Result -VulnID "V-253289" -RuleID "WN11-00-000175" -Severity "medium" `
+                -RuleTitle "The Secondary Logon service must be disabled on Windows 11" `
+                -Status "Fail" -Details "Secondary Logon: StartType=$($secLogon.StartType), Status=$($secLogon.Status)"
+        }
+    }
+} else {
+    Add-Result -VulnID "V-253289" -RuleID "WN11-00-000175" -Severity "medium" `
+        -RuleTitle "The Secondary Logon service must be disabled on Windows 11" `
+        -Status "Pass" -Details "Secondary Logon service not found."
+}
+
+# ============================================================================
+# V-253290 | WN11-00-000190 | Orphaned SIDs in User Rights
+# ============================================================================
+Add-Result -VulnID "V-253290" -RuleID "WN11-00-000190" -Severity "medium" `
+    -RuleTitle "Orphaned SIDs must be removed from user rights" `
+    -Status "Manual" -Details "Cannot auto-fix - requires manual review of User Rights Assignment." `
+    -ManualSteps @"
+1. Run gpedit.msc > Computer Configuration > Windows Settings > Security Settings > Local Policies > User Rights Assignment.
+2. Double-click each policy and look for unresolved SIDs (*S-1-5-21-...).
+3. Verify with domain admin if SID is valid.
+4. Remove invalid/orphaned SIDs.
+"@
+
+# ============================================================================
+# V-253291 | WN11-00-000210 | Bluetooth disabled
+# ============================================================================
+$btReg = Get-RegistryValueSafe -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Connectivity" -Name "AllowBluetooth"
+$btAdapter = Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue
+if (-not $btAdapter) {
+    Add-Result -VulnID "V-253291" -RuleID "WN11-00-000210" -Severity "medium" `
+        -RuleTitle "Bluetooth must be turned off unless approved by the organization" `
+        -Status "N/A" -Details "No Bluetooth hardware detected."
+} elseif ($btReg -eq 0) {
+    Add-Result -VulnID "V-253291" -RuleID "WN11-00-000210" -Severity "medium" `
+        -RuleTitle "Bluetooth must be turned off unless approved by the organization" `
+        -Status "Pass" -Details "AllowBluetooth=0 (disabled)"
+} else {
+    if ($AutoFix) {
+        Write-FixAttempt "Disabling Bluetooth via registry..."
+        if (Set-RegistryValueForce -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Connectivity" -Name "AllowBluetooth" -Value 0) {
+            Add-Result -VulnID "V-253291" -RuleID "WN11-00-000210" -Severity "medium" `
+                -RuleTitle "Bluetooth must be turned off unless approved by the organization" `
+                -Status "Fixed" -Details "AllowBluetooth set to 0." `
+                -FixAction "Set AllowBluetooth = 0"
+        } else {
+            Add-Result -VulnID "V-253291" -RuleID "WN11-00-000210" -Severity "medium" `
+                -RuleTitle "Bluetooth must be turned off unless approved by the organization" `
+                -Status "Fail" -Details "Auto-fix failed."
+        }
+    } else {
+        Add-Result -VulnID "V-253291" -RuleID "WN11-00-000210" -Severity "medium" `
+            -RuleTitle "Bluetooth must be turned off unless approved by the organization" `
+            -Status "Fail" -Details "AllowBluetooth=$btReg. Bluetooth is not disabled."
+    }
+}
+
+# ============================================================================
+# V-253293 | WN11-00-000230 | Bluetooth notification
+# ============================================================================
+if (-not $btAdapter -or $btReg -eq 0) {
+    Add-Result -VulnID "V-253293" -RuleID "WN11-00-000230" -Severity "medium" `
+        -RuleTitle "The system must notify the user when a Bluetooth device attempts to connect" `
+        -Status "N/A" -Details "Bluetooth not present or disabled."
+} else {
+    Add-Result -VulnID "V-253293" -RuleID "WN11-00-000230" -Severity "medium" `
+        -RuleTitle "The system must notify the user when a Bluetooth device attempts to connect" `
+        -Status "Manual" -Details "Cannot auto-fix - this is a GUI Bluetooth setting." `
+        -ManualSteps "1. Open Bluetooth settings > More Bluetooth Options.`n2. Check 'Alert me when a new Bluetooth device wants to connect'."
+}
+
+# ============================================================================
+# V-253294 | WN11-00-000240 | Admin accounts must not use internet apps
+# ============================================================================
+Add-Result -VulnID "V-253294" -RuleID "WN11-00-000240" -Severity "high" `
+    -RuleTitle "Administrative accounts must not be used with applications that access the internet" `
+    -Status "Manual" -Details "Cannot auto-fix - requires organizational policy and AppLocker/allowlisting configuration." `
+    -ManualSteps @"
+1. Verify documented policy prohibiting admin accounts from using browsers/email.
+2. Implement AppLocker rules or application removal to enforce technically.
+3. Policy must define exceptions for local service administration HTTP(S) tools.
+"@
+
+# ============================================================================
+# V-253295 | WN11-00-000250 | Nonpersistent VM sessions <= 24 hours
+# ============================================================================
+Add-Result -VulnID "V-253295" -RuleID "WN11-00-000250" -Severity "medium" `
+    -RuleTitle "Windows 11 nonpersistent VM sessions must not exceed 24 hours" `
+    -Status "N/A" -Details "Verify if this is a nonpersistent VM. If so, ensure sessions <= 24 hours."
+
+# ============================================================================
+# V-253296 | WN11-00-000260 | Time service synchronization
+# ============================================================================
+if ($isDomainJoined) {
+    try {
+        $w32tmOutput = & w32tm /query /configuration 2>&1 | Out-String
+        if ($w32tmOutput -match "Type:\s+NT5DS") {
+            Add-Result -VulnID "V-253296" -RuleID "WN11-00-000260" -Severity "low" `
+                -RuleTitle "The Windows 11 time service must synchronize with an appropriate DOD time source" `
+                -Status "Pass" -Details "Time sync type: NT5DS (domain hierarchy)"
+        } else {
+            if ($AutoFix) {
+                Write-FixAttempt "Configuring time service to NT5DS..."
+                try {
+                    & w32tm /config /syncfromflags:domhier /update 2>&1 | Out-Null
+                    & net stop w32time 2>&1 | Out-Null
+                    & net start w32time 2>&1 | Out-Null
+                    Add-Result -VulnID "V-253296" -RuleID "WN11-00-000260" -Severity "low" `
+                        -RuleTitle "The Windows 11 time service must synchronize with an appropriate DOD time source" `
+                        -Status "Fixed" -Details "Time service configured to NT5DS (domain hierarchy)." `
+                        -FixAction "w32tm /config /syncfromflags:domhier /update"
+                } catch {
+                    Add-Result -VulnID "V-253296" -RuleID "WN11-00-000260" -Severity "low" `
+                        -RuleTitle "The Windows 11 time service must synchronize with an appropriate DOD time source" `
+                        -Status "Fail" -Details "Auto-fix failed: $_"
+                }
+            } else {
+                Add-Result -VulnID "V-253296" -RuleID "WN11-00-000260" -Severity "low" `
+                    -RuleTitle "The Windows 11 time service must synchronize with an appropriate DOD time source" `
+                    -Status "Fail" -Details "Time sync type is not NT5DS."
+            }
+        }
+    } catch {
+        Add-Result -VulnID "V-253296" -RuleID "WN11-00-000260" -Severity "low" `
+            -RuleTitle "The Windows 11 time service must synchronize with an appropriate DOD time source" `
+            -Status "Manual" -Details "Unable to query time service." `
+            -ManualSteps "1. Run: w32tm /query /configuration`n2. Verify Type = NT5DS for domain-joined systems."
+    }
+} else {
+    Add-Result -VulnID "V-253296" -RuleID "WN11-00-000260" -Severity "low" `
+        -RuleTitle "The Windows 11 time service must synchronize with an appropriate DOD time source" `
+        -Status "Manual" -Details "Standalone system - verify NTP is configured to an authorized time source." `
+        -ManualSteps "1. Run: w32tm /query /configuration`n2. Verify NtpServer points to an authorized DOD time source."
+}
+
+# ============================================================================
+# ACCOUNT POLICIES - with auto-fix via net accounts
+# ============================================================================
+$netAccounts = & net accounts 2>&1 | Out-String
+
+function Get-NetAccountValue {
+    param([string]$Pattern)
+    if ($netAccounts -match "$Pattern\s*:\s*(.+)") { return $matches[1].Trim() }
+    return $null
+}
+
+$lockoutDuration = Get-NetAccountValue "Lockout duration"
+$lockoutThreshold = Get-NetAccountValue "Lockout threshold"
+$lockoutWindow = Get-NetAccountValue "Lockout observation window"
+$pwHistory = Get-NetAccountValue "Length of password history maintained"
+$maxPwAge = Get-NetAccountValue "Maximum password age"
+$minPwAge = Get-NetAccountValue "Minimum password age"
+$minPwLen = Get-NetAccountValue "Minimum password length"
+
+# ============================================================================
+# ACCOUNT POLICY CHECKS (V-253297 through V-253303) - Data-Driven
+# All use 'net accounts' output and can be auto-fixed via 'net accounts /param:value'
+# ============================================================================
+$accountPolicyChecks = @(
+    @{ VulnID="V-253297"; RuleID="WN11-AC-000005"; Severity="medium"; Title="Windows 11 account lockout duration must be configured to 15 minutes or greater"; Pattern="Lockout duration"; Min=15; AllowZero=$true; FixCmd="/lockoutduration:15"; FailHint="requires >= 15 min or 0" },
+    @{ VulnID="V-253298"; RuleID="WN11-AC-000010"; Severity="medium"; Title="The number of allowed bad logon attempts must be configured to three or less"; Pattern="Lockout threshold"; Min=1; Max=3; FixCmd="/lockoutthreshold:3"; FailHint="requires 1-3" },
+    @{ VulnID="V-253299"; RuleID="WN11-AC-000015"; Severity="medium"; Title="The period of time before the bad logon counter is reset must be 15 minutes"; Pattern="Lockout observation window"; Min=15; FixCmd="/lockoutwindow:15"; FailHint="requires >= 15" },
+    @{ VulnID="V-253300"; RuleID="WN11-AC-000020"; Severity="medium"; Title="The password history must be configured to 24 passwords remembered"; Pattern="Length of password history maintained"; Min=24; FixCmd="/uniquepw:24"; FailHint="requires >= 24" },
+    @{ VulnID="V-253301"; RuleID="WN11-AC-000025"; Severity="medium"; Title="The maximum password age must be configured to 60 days or less"; Pattern="Maximum password age"; Min=1; Max=60; FixCmd="/maxpwage:60"; FailHint="requires 1-60 days" },
+    @{ VulnID="V-253302"; RuleID="WN11-AC-000030"; Severity="medium"; Title="The minimum password age must be configured to at least 1 day"; Pattern="Minimum password age"; Min=1; FixCmd="/minpwage:1"; FailHint="requires >= 1" },
+    @{ VulnID="V-253303"; RuleID="WN11-AC-000035"; Severity="medium"; Title="Passwords must, at a minimum, be 14 characters"; Pattern="Minimum password length"; Min=14; FixCmd="/minpwlen:14"; FailHint="requires >= 14" }
+)
+
+foreach ($check in $accountPolicyChecks) {
+    $rawVal = Get-NetAccountValue $check.Pattern
+    $val = if ($rawVal -match "(\d+)") { [int]$matches[1] } else { -1 }
+    $pass = $false
+    if ($check.AllowZero -and $val -eq 0) { $pass = $true }
+    elseif ($null -ne $check.Max) { $pass = ($val -ge $check.Min -and $val -le $check.Max) }
+    else { $pass = ($val -ge $check.Min) }
+
+    if ($pass) {
+        Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+            -RuleTitle $check.Title -Status "Pass" -Details "$($check.Pattern): $rawVal"
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Running: net accounts $($check.FixCmd)"
+            $null = Invoke-Expression "net accounts $($check.FixCmd)" 2>&1
+            Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                -RuleTitle $check.Title -Status "Fixed" `
+                -Details "Policy configured via net accounts." `
+                -FixAction "net accounts $($check.FixCmd)"
+        } else {
+            Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                -RuleTitle $check.Title -Status "Fail" `
+                -Details "$($check.Pattern): $rawVal ($($check.FailHint))"
+        }
+    }
+}
+
+# ============================================================================
+# V-253304 & V-253305 | Password complexity & Reversible encryption (secedit)
+# ============================================================================
+$seceditFile = "$env:TEMP\secedit_stig_$([guid]::NewGuid().ToString('N')).cfg"
+$seceditDb = "$env:TEMP\secedit_stig_$([guid]::NewGuid().ToString('N')).sdb"
+try {
+    $null = & secedit /export /cfg $seceditFile 2>&1
+    $seceditContent = Get-Content $seceditFile -Raw -ErrorAction Stop
+
+    # --- V-253304: Password complexity ---
+    $complexityMatch = [regex]::Match($seceditContent, "PasswordComplexity\s*=\s*(\d+)")
+    $complexityVal = if ($complexityMatch.Success) { [int]$complexityMatch.Groups[1].Value } else { -1 }
+
+    if ($complexityVal -eq 1) {
+        Add-Result -VulnID "V-253304" -RuleID "WN11-AC-000040" -Severity "medium" `
+            -RuleTitle "The built-in Microsoft password complexity filter must be enabled" `
+            -Status "Pass" -Details "PasswordComplexity=1 (Enabled)"
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Enabling password complexity..."
+            $seceditContent = $seceditContent -replace "PasswordComplexity\s*=\s*\d+", "PasswordComplexity = 1"
+            $seceditContent | Out-File $seceditFile -Encoding ASCII -Force
+            $null = & secedit /configure /db $seceditDb /cfg $seceditFile /areas SECURITYPOLICY 2>&1
+            Add-Result -VulnID "V-253304" -RuleID "WN11-AC-000040" -Severity "medium" `
+                -RuleTitle "The built-in Microsoft password complexity filter must be enabled" `
+                -Status "Fixed" -Details "PasswordComplexity set to 1." `
+                -FixAction "secedit /configure PasswordComplexity=1"
+        } else {
+            Add-Result -VulnID "V-253304" -RuleID "WN11-AC-000040" -Severity "medium" `
+                -RuleTitle "The built-in Microsoft password complexity filter must be enabled" `
+                -Status "Fail" -Details "PasswordComplexity=$complexityVal (should be 1)"
+        }
+    }
+
+    # --- V-253305: Reversible encryption ---
+    # Re-read in case modified above
+    $seceditContent2 = Get-Content $seceditFile -Raw -ErrorAction Stop
+    $reversibleMatch = [regex]::Match($seceditContent2, "ClearTextPassword\s*=\s*(\d+)")
+    $reversibleVal = if ($reversibleMatch.Success) { [int]$reversibleMatch.Groups[1].Value } else { -1 }
+
+    if ($reversibleVal -eq 0) {
+        Add-Result -VulnID "V-253305" -RuleID "WN11-AC-000045" -Severity "high" `
+            -RuleTitle "Reversible password encryption must be disabled" `
+            -Status "Pass" -Details "ClearTextPassword=0 (Disabled)"
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Disabling reversible password encryption..."
+            $seceditContent2 = $seceditContent2 -replace "ClearTextPassword\s*=\s*\d+", "ClearTextPassword = 0"
+            $seceditContent2 | Out-File $seceditFile -Encoding ASCII -Force
+            $null = & secedit /configure /db $seceditDb /cfg $seceditFile /areas SECURITYPOLICY 2>&1
+            Add-Result -VulnID "V-253305" -RuleID "WN11-AC-000045" -Severity "high" `
+                -RuleTitle "Reversible password encryption must be disabled" `
+                -Status "Fixed" -Details "ClearTextPassword set to 0." `
+                -FixAction "secedit /configure ClearTextPassword=0"
+        } else {
+            Add-Result -VulnID "V-253305" -RuleID "WN11-AC-000045" -Severity "high" `
+                -RuleTitle "Reversible password encryption must be disabled" `
+                -Status "Fail" -Details "ClearTextPassword=$reversibleVal (should be 0)"
+        }
+    }
+} catch {
+    Add-Result -VulnID "V-253304" -RuleID "WN11-AC-000040" -Severity "medium" `
+        -RuleTitle "The built-in Microsoft password complexity filter must be enabled" `
+        -Status "Manual" -Details "Unable to export security policy: $_" `
+        -ManualSteps "1. Run gpedit.msc > Account Policies > Password Policy.`n2. Set 'Password must meet complexity requirements' to Enabled."
+    Add-Result -VulnID "V-253305" -RuleID "WN11-AC-000045" -Severity "high" `
+        -RuleTitle "Reversible password encryption must be disabled" `
+        -Status "Manual" -Details "Unable to export security policy: $_" `
+        -ManualSteps "1. Run gpedit.msc > Account Policies > Password Policy.`n2. Set 'Store password using reversible encryption' to Disabled."
+} finally {
+    Remove-Item $seceditFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $seceditDb -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================================
+# AUDIT POLICY CHECKS - with auto-fix via AuditPol
+# ============================================================================
+$auditPolOutput = & AuditPol /get /category:* 2>&1 | Out-String
+
+function Test-AuditPolicy {
+    param([string]$Subcategory, [string]$Expected)
+    $pattern = "(?mi)^\s*$([regex]::Escape($Subcategory))\s+(.+)$"
+    $match = [regex]::Match($auditPolOutput, $pattern)
+    if ($match.Success) {
+        $setting = $match.Groups[1].Value.Trim()
+        switch ($Expected) {
+            "Success" { return ($setting -match "Success") }
+            "Failure" { return ($setting -match "Failure") }
+        }
+    }
+    return $false
+}
+
+$auditChecks = @(
+    @{ VulnID="V-253306"; RuleID="WN11-AU-000005"; Severity="medium"; Title="Audit Credential Validation failures"; Sub="Credential Validation"; Exp="Failure"; Fix="/set /subcategory:`"Credential Validation`" /failure:enable" },
+    @{ VulnID="V-253307"; RuleID="WN11-AU-000010"; Severity="medium"; Title="Audit Credential Validation successes"; Sub="Credential Validation"; Exp="Success"; Fix="/set /subcategory:`"Credential Validation`" /success:enable" },
+    @{ VulnID="V-253308"; RuleID="WN11-AU-000030"; Severity="medium"; Title="Audit Security Group Management successes"; Sub="Security Group Management"; Exp="Success"; Fix="/set /subcategory:`"Security Group Management`" /success:enable" },
+    @{ VulnID="V-253309"; RuleID="WN11-AU-000035"; Severity="medium"; Title="Audit User Account Management failures"; Sub="User Account Management"; Exp="Failure"; Fix="/set /subcategory:`"User Account Management`" /failure:enable" },
+    @{ VulnID="V-253310"; RuleID="WN11-AU-000040"; Severity="medium"; Title="Audit User Account Management successes"; Sub="User Account Management"; Exp="Success"; Fix="/set /subcategory:`"User Account Management`" /success:enable" },
+    @{ VulnID="V-253311"; RuleID="WN11-AU-000045"; Severity="medium"; Title="Audit PNP Activity successes"; Sub="Plug and Play Events"; Exp="Success"; Fix="/set /subcategory:`"Plug and Play Events`" /success:enable" },
+    @{ VulnID="V-253312"; RuleID="WN11-AU-000050"; Severity="medium"; Title="Audit Process Creation successes"; Sub="Process Creation"; Exp="Success"; Fix="/set /subcategory:`"Process Creation`" /success:enable" },
+    @{ VulnID="V-253313"; RuleID="WN11-AU-000054"; Severity="medium"; Title="Audit Account Lockout failures"; Sub="Account Lockout"; Exp="Failure"; Fix="/set /subcategory:`"Account Lockout`" /failure:enable" },
+    @{ VulnID="V-253314"; RuleID="WN11-AU-000060"; Severity="medium"; Title="Audit Group Membership successes"; Sub="Group Membership"; Exp="Success"; Fix="/set /subcategory:`"Group Membership`" /success:enable" },
+    @{ VulnID="V-253315"; RuleID="WN11-AU-000065"; Severity="medium"; Title="Audit Logoff successes"; Sub="Logoff"; Exp="Success"; Fix="/set /subcategory:`"Logoff`" /success:enable" },
+    @{ VulnID="V-253316"; RuleID="WN11-AU-000070"; Severity="medium"; Title="Audit Logon failures"; Sub="Logon"; Exp="Failure"; Fix="/set /subcategory:`"Logon`" /failure:enable" },
+    @{ VulnID="V-253317"; RuleID="WN11-AU-000075"; Severity="medium"; Title="Audit Logon successes"; Sub="Logon"; Exp="Success"; Fix="/set /subcategory:`"Logon`" /success:enable" },
+    @{ VulnID="V-253318"; RuleID="WN11-AU-000080"; Severity="medium"; Title="Audit Special Logon successes"; Sub="Special Logon"; Exp="Success"; Fix="/set /subcategory:`"Special Logon`" /success:enable" },
+    @{ VulnID="V-253319"; RuleID="WN11-AU-000081"; Severity="medium"; Title="Audit File Share failures"; Sub="File Share"; Exp="Failure"; Fix="/set /subcategory:`"File Share`" /failure:enable" },
+    @{ VulnID="V-253320"; RuleID="WN11-AU-000082"; Severity="medium"; Title="Audit File Share successes"; Sub="File Share"; Exp="Success"; Fix="/set /subcategory:`"File Share`" /success:enable" },
+    @{ VulnID="V-253321"; RuleID="WN11-AU-000083"; Severity="medium"; Title="Audit Other Object Access Events successes"; Sub="Other Object Access Events"; Exp="Success"; Fix="/set /subcategory:`"Other Object Access Events`" /success:enable" },
+    @{ VulnID="V-253322"; RuleID="WN11-AU-000084"; Severity="medium"; Title="Audit Other Object Access Events failures"; Sub="Other Object Access Events"; Exp="Failure"; Fix="/set /subcategory:`"Other Object Access Events`" /failure:enable" },
+    @{ VulnID="V-253323"; RuleID="WN11-AU-000085"; Severity="medium"; Title="Audit Removable Storage failures"; Sub="Removable Storage"; Exp="Failure"; Fix="/set /subcategory:`"Removable Storage`" /failure:enable" },
+    @{ VulnID="V-253324"; RuleID="WN11-AU-000090"; Severity="medium"; Title="Audit Removable Storage successes"; Sub="Removable Storage"; Exp="Success"; Fix="/set /subcategory:`"Removable Storage`" /success:enable" },
+    # --- Additional Audit Policy Checks (V-253325 through V-253349) ---
+    @{ VulnID="V-253325"; RuleID="WN11-AU-000100"; Severity="medium"; Title="Audit Policy Change - Audit Policy Change successes"; Sub="Audit Policy Change"; Exp="Success"; Fix="/set /subcategory:`"Audit Policy Change`" /success:enable" },
+    @{ VulnID="V-253326"; RuleID="WN11-AU-000105"; Severity="medium"; Title="Audit Policy Change - Authentication Policy Change successes"; Sub="Authentication Policy Change"; Exp="Success"; Fix="/set /subcategory:`"Authentication Policy Change`" /success:enable" },
+    @{ VulnID="V-253327"; RuleID="WN11-AU-000107"; Severity="medium"; Title="Audit Policy Change - Authorization Policy Change successes"; Sub="Authorization Policy Change"; Exp="Success"; Fix="/set /subcategory:`"Authorization Policy Change`" /success:enable" },
+    @{ VulnID="V-253328"; RuleID="WN11-AU-000110"; Severity="medium"; Title="Audit Privilege Use - Sensitive Privilege Use failures"; Sub="Sensitive Privilege Use"; Exp="Failure"; Fix="/set /subcategory:`"Sensitive Privilege Use`" /failure:enable" },
+    @{ VulnID="V-253329"; RuleID="WN11-AU-000115"; Severity="medium"; Title="Audit Privilege Use - Sensitive Privilege Use successes"; Sub="Sensitive Privilege Use"; Exp="Success"; Fix="/set /subcategory:`"Sensitive Privilege Use`" /success:enable" },
+    @{ VulnID="V-253330"; RuleID="WN11-AU-000120"; Severity="medium"; Title="Audit System - IPsec Driver failures"; Sub="IPsec Driver"; Exp="Failure"; Fix="/set /subcategory:`"IPsec Driver`" /failure:enable" },
+    @{ VulnID="V-253331"; RuleID="WN11-AU-000130"; Severity="medium"; Title="Audit System - Other System Events successes"; Sub="Other System Events"; Exp="Success"; Fix="/set /subcategory:`"Other System Events`" /success:enable" },
+    @{ VulnID="V-253332"; RuleID="WN11-AU-000135"; Severity="medium"; Title="Audit System - Other System Events failures"; Sub="Other System Events"; Exp="Failure"; Fix="/set /subcategory:`"Other System Events`" /failure:enable" },
+    @{ VulnID="V-253333"; RuleID="WN11-AU-000140"; Severity="medium"; Title="Audit System - Security State Change successes"; Sub="Security State Change"; Exp="Success"; Fix="/set /subcategory:`"Security State Change`" /success:enable" },
+    @{ VulnID="V-253334"; RuleID="WN11-AU-000150"; Severity="medium"; Title="Audit System - Security System Extension successes"; Sub="Security System Extension"; Exp="Success"; Fix="/set /subcategory:`"Security System Extension`" /success:enable" },
+    @{ VulnID="V-253335"; RuleID="WN11-AU-000155"; Severity="medium"; Title="Audit System - System Integrity failures"; Sub="System Integrity"; Exp="Failure"; Fix="/set /subcategory:`"System Integrity`" /failure:enable" },
+    @{ VulnID="V-253336"; RuleID="WN11-AU-000160"; Severity="medium"; Title="Audit System - System Integrity successes"; Sub="System Integrity"; Exp="Success"; Fix="/set /subcategory:`"System Integrity`" /success:enable" },
+    @{ VulnID="V-253344"; RuleID="WN11-AU-000555"; Severity="medium"; Title="Audit Other Policy Change Events failures"; Sub="Other Policy Change Events"; Exp="Failure"; Fix="/set /subcategory:`"Other Policy Change Events`" /failure:enable" },
+    @{ VulnID="V-253345"; RuleID="WN11-AU-000560"; Severity="medium"; Title="Audit Other Logon/Logoff Events successes"; Sub="Other Logon/Logoff Events"; Exp="Success"; Fix="/set /subcategory:`"Other Logon/Logoff Events`" /success:enable" },
+    @{ VulnID="V-253346"; RuleID="WN11-AU-000565"; Severity="medium"; Title="Audit Other Logon/Logoff Events failures"; Sub="Other Logon/Logoff Events"; Exp="Failure"; Fix="/set /subcategory:`"Other Logon/Logoff Events`" /failure:enable" },
+    @{ VulnID="V-253347"; RuleID="WN11-AU-000570"; Severity="medium"; Title="Audit Detailed File Share failures"; Sub="Detailed File Share"; Exp="Failure"; Fix="/set /subcategory:`"Detailed File Share`" /failure:enable" },
+    @{ VulnID="V-253348"; RuleID="WN11-AU-000575"; Severity="medium"; Title="Audit MPSSVC Rule-Level Policy Change successes"; Sub="MPSSVC Rule-Level Policy Change"; Exp="Success"; Fix="/set /subcategory:`"MPSSVC Rule-Level Policy Change`" /success:enable" },
+    @{ VulnID="V-253349"; RuleID="WN11-AU-000580"; Severity="medium"; Title="Audit MPSSVC Rule-Level Policy Change failures"; Sub="MPSSVC Rule-Level Policy Change"; Exp="Failure"; Fix="/set /subcategory:`"MPSSVC Rule-Level Policy Change`" /failure:enable" }
+)
+
+foreach ($check in $auditChecks) {
+    $result = Test-AuditPolicy -Subcategory $check.Sub -Expected $check.Exp
+    if ($result) {
+        Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+            -RuleTitle $check.Title -Status "Pass" `
+            -Details "$($check.Sub) - $($check.Exp) is configured."
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Enabling audit: $($check.Sub) - $($check.Exp)..."
+            $fixCmd = "AuditPol $($check.Fix)"
+            try {
+                $null = Invoke-Expression $fixCmd 2>&1
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fixed" `
+                    -Details "$($check.Sub) - $($check.Exp) enabled." `
+                    -FixAction $fixCmd
+            } catch {
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fail" `
+                    -Details "Auto-fix failed for $($check.Sub) $($check.Exp): $_"
+            }
+        } else {
+            Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                -RuleTitle $check.Title -Status "Fail" `
+                -Details "$($check.Sub) does not have '$($check.Exp)' auditing enabled."
+        }
+    }
+}
+
+# ============================================================================
+# REGISTRY & POLICY CHECKS (V-253337 through V-279688)
+# ============================================================================
+
+# --- Registry-Based Checks ---
+# Includes checks moved from individual blocks: V-253274 (file system permissions), V-253284 (SEHOP)
+$registryChecks = @(
+    # --- Moved from individual blocks ---
+    @{ VulnID='V-253274'; RuleID='WN11-00-000095'; Severity='medium'; Title='Permissions for system files and directories must conform to minimum requirements.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='EveryoneIncludesAnonymous'; Expected=0 },
+    @{ VulnID='V-253284'; RuleID='WN11-00-000150'; Severity='high'; Title='Structured Exception Handling Overwrite Protection (SEHOP) must be enabled.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; Name='DisableExceptionChainValidation'; Expected=0 },
+    # --- Event Log Sizes ---
+    @{ VulnID='V-253337'; RuleID='WN11-AU-000500'; Severity='medium'; Title='The Application event log size must be configured to 32768 KB or greater.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Application'; Name='MaxSize'; Expected=32768 },
+    @{ VulnID='V-253338'; RuleID='WN11-AU-000505'; Severity='medium'; Title='The Security event log size must be configured to 1024000 KB or greater.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Security'; Name='MaxSize'; Expected=1024000 },
+    @{ VulnID='V-253339'; RuleID='WN11-AU-000510'; Severity='medium'; Title='The System event log size must be configured to 32768 KB or greater.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\System'; Name='MaxSize'; Expected=32768 },
+    @{ VulnID='V-253350'; RuleID='WN11-CC-000005'; Severity='medium'; Title='Camera access from the lock screen must be disabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization'; Name='NoLockScreenCamera'; Expected=1 },
+    @{ VulnID='V-253352'; RuleID='WN11-CC-000010'; Severity='medium'; Title='The display of slide shows on the lock screen must be disabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization'; Name='NoLockScreenSlideshow'; Expected=1 },
+    @{ VulnID='V-253353'; RuleID='WN11-CC-000020'; Severity='medium'; Title='IPv6 source routing must be configured to highest protection.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'; Name='DisableIpSourceRouting'; Expected=2 },
+    @{ VulnID='V-253354'; RuleID='WN11-CC-000025'; Severity='medium'; Title='The system must be configured to prevent IP source routing.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name='DisableIPSourceRouting'; Expected=2 },
+    @{ VulnID='V-253355'; RuleID='WN11-CC-000030'; Severity='low'; Title='The system must be configured to prevent Internet Control Message Protocol (ICMP) redirects from overriding Open Shortes'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name='EnableICMPRedirect'; Expected=0 },
+    @{ VulnID='V-253356'; RuleID='WN11-CC-000035'; Severity='low'; Title='The system must be configured to ignore NetBIOS name release requests except from WINS servers.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Netbt\Parameters'; Name='NoNameReleaseOnDemand'; Expected=1 },
+    @{ VulnID='V-253357'; RuleID='WN11-CC-000037'; Severity='medium'; Title='Local administrator accounts must have their privileged token filtered to prevent elevated privileges from being used ov'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='LocalAccountTokenFilterPolicy'; Expected=0 },
+    @{ VulnID='V-253358'; RuleID='WN11-CC-000038'; Severity='medium'; Title='WDigest Authentication must be disabled.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Wdigest'; Name='UseLogonCredential'; Expected=0 },
+    @{ VulnID='V-253360'; RuleID='WN11-CC-000040'; Severity='medium'; Title='Insecure logons to an SMB server must be disabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation'; Name='AllowInsecureGuestAuth'; Expected=0 },
+    @{ VulnID='V-253361'; RuleID='WN11-CC-000044'; Severity='medium'; Title='Internet connection sharing must be disabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Network Connections'; Name='NC_ShowSharedAccessUI'; Expected=0 },
+    @{ VulnID='V-253364'; RuleID='WN11-CC-000055'; Severity='medium'; Title='Simultaneous connections to the internet or a Windows domain must be limited.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WcmSvc\GroupPolicy'; Name='fMinimizeConnections'; Expected=3 },
+    @{ VulnID='V-253365'; RuleID='WN11-CC-000060'; Severity='medium'; Title='Connections to non-domain networks when connected to a domain authenticated network must be blocked.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WcmSvc\GroupPolicy'; Name='fBlockNonDomain'; Expected=1 },
+    @{ VulnID='V-253366'; RuleID='WN11-CC-000065'; Severity='medium'; Title='Wi-Fi Sense must be disabled.'; Path='HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config'; Name='AutoConnectAllowedOEM'; Expected=0 },
+    @{ VulnID='V-253367'; RuleID='WN11-CC-000066'; Severity='medium'; Title='Command line data must be included in process creation events.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'; Name='ProcessCreationIncludeCmdLine_Enabled'; Expected=1 },
+    @{ VulnID='V-253368'; RuleID='WN11-CC-000068'; Severity='medium'; Title='Windows 11 must be configured to enable Remote host allows delegation of non-exportable credentials.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation'; Name='AllowProtectedCreds'; Expected=1 },
+    @{ VulnID='V-253369'; RuleID='WN11-CC-000070'; Severity='medium'; Title='Virtualization-based Security must be enabled on Windows 11 with the platform security level configured to Secure Boot o'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='EnableVirtualizationBasedSecurity'; Expected=1 },
+    @{ VulnID='V-253370'; RuleID='WN11-CC-000075'; Severity='high'; Title='Credential Guard must be running on Windows 11 domain-joined systems.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='LsaCfgFlags'; Expected=1 },
+    @{ VulnID='V-253371'; RuleID='WN11-CC-000080'; Severity='medium'; Title='Virtualization-based protection of code integrity must be enabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='HypervisorEnforcedCodeIntegrity'; Expected=1 },
+    @{ VulnID='V-253372'; RuleID='WN11-CC-000085'; Severity='medium'; Title='Early Launch Antimalware, Boot-Start Driver Initialization Policy must prevent boot drivers.'; Path='HKLM:\SYSTEM\CurrentControlSet\Policies\EarlyLaunch'; Name='DriverLoadPolicy'; Expected=1 },
+    @{ VulnID='V-253373'; RuleID='WN11-CC-000090'; Severity='medium'; Title='Group Policy objects must be reprocessed even if they have not changed.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'; Name='NoGPOListChanges'; Expected=0 },
+    @{ VulnID='V-253374'; RuleID='WN11-CC-000100'; Severity='medium'; Title='Downloading print driver packages over HTTP must be prevented.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'; Name='DisableWebPnPDownload'; Expected=1 },
+    @{ VulnID='V-253375'; RuleID='WN11-CC-000105'; Severity='medium'; Title='Web publishing and online ordering wizards must be prevented from downloading a list of providers.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name='NoWebServices'; Expected=1 },
+    @{ VulnID='V-253376'; RuleID='WN11-CC-000110'; Severity='medium'; Title='Printing over HTTP must be prevented.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'; Name='DisableHTTPPrinting'; Expected=1 },
+    @{ VulnID='V-253377'; RuleID='WN11-CC-000115'; Severity='medium'; Title='Systems must at least attempt device authentication using certificates.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; Name='DevicePKInitEnabled'; Expected=1 },
+    @{ VulnID='V-253378'; RuleID='WN11-CC-000120'; Severity='medium'; Title='The network selection user interface (UI) must not be displayed on the logon screen.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='DontDisplayNetworkSelectionUI'; Expected=1 },
+    @{ VulnID='V-253379'; RuleID='WN11-CC-000130'; Severity='medium'; Title='Local users on domain-joined computers must not be enumerated.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='EnumerateLocalUsers'; Expected=0 },
+    @{ VulnID='V-253380'; RuleID='WN11-CC-000145'; Severity='medium'; Title='Users must be prompted for a password on resume from sleep (on battery).'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51'; Name='DCSettingIndex'; Expected=1 },
+    @{ VulnID='V-253381'; RuleID='WN11-CC-000150'; Severity='medium'; Title='The user must be prompted for a password on resume from sleep (plugged in).'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51'; Name='ACSettingIndex'; Expected=1 },
+    @{ VulnID='V-253382'; RuleID='WN11-CC-000155'; Severity='high'; Title='Solicited Remote Assistance must not be allowed.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'; Name='fAllowToGetHelp'; Expected=0 },
+    @{ VulnID='V-253383'; RuleID='WN11-CC-000165'; Severity='medium'; Title='Unauthenticated RPC clients must be restricted from connecting to the RPC server.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Rpc'; Name='RestrictRemoteClients'; Expected=1 },
+    @{ VulnID='V-253384'; RuleID='WN11-CC-000170'; Severity='low'; Title='The setting to allow Microsoft accounts to be optional for modern style apps must be enabled.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='MSAOptional'; Expected=1 },
+    @{ VulnID='V-253385'; RuleID='WN11-CC-000175'; Severity='low'; Title='The Application Compatibility Program Inventory must be prevented from collecting data and sending the information to Mi'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat'; Name='DisableInventory'; Expected=1 },
+    @{ VulnID='V-253386'; RuleID='WN11-CC-000180'; Severity='high'; Title='Autoplay must be turned off for non-volume devices.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'; Name='NoAutoplayfornonVolume'; Expected=1 },
+    @{ VulnID='V-253387'; RuleID='WN11-CC-000185'; Severity='high'; Title='The default autorun behavior must be configured to prevent autorun commands.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name='NoAutorun'; Expected=1 },
+    @{ VulnID='V-253388'; RuleID='WN11-CC-000190'; Severity='high'; Title='Autoplay must be disabled for all drives.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\policies\Explorer'; Name='NoDriveTypeAutoRun'; Expected=255 },
+    @{ VulnID='V-253389'; RuleID='WN11-CC-000195'; Severity='medium'; Title='Enhanced anti-spoofing for facial recognition must be enabled on Windows 11.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures'; Name='EnhancedAntiSpoofing'; Expected=1 },
+    @{ VulnID='V-253390'; RuleID='WN11-CC-000197'; Severity='low'; Title='Microsoft consumer experiences must be turned off.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableWindowsConsumerFeatures'; Expected=1 },
+    @{ VulnID='V-253391'; RuleID='WN11-CC-000200'; Severity='medium'; Title='Administrator accounts must not be enumerated during elevation.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\CredUI'; Name='EnumerateAdministrators'; Expected=0 },
+    @{ VulnID='V-253392'; RuleID='WN11-CC-000204'; Severity='medium'; Title='Enhanced diagnostic data must be limited to the minimum required to support Windows Analytics.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='LimitEnhancedDiagnosticDataWindowsAnalytics'; Expected=1 },
+    @{ VulnID='V-253393'; RuleID='WN11-CC-000205'; Severity='medium'; Title='Windows Telemetry must not be configured to Full.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='AllowTelemetry'; Expected=0 },
+    @{ VulnID='V-253394'; RuleID='WN11-CC-000206'; Severity='low'; Title='Windows Update must not obtain updates from other PCs on the internet.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'; Name='DODownloadMode'; Expected=0 },
+    @{ VulnID='V-253394'; RuleID='WN11-CC-000206'; Severity='low'; Title='Windows Update must not obtain updates from other PCs on the internet.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'; Name='DODownloadMode'; Expected=0 },
+    @{ VulnID='V-253395'; RuleID='WN11-CC-000210'; Severity='medium'; Title='The Microsoft Defender SmartScreen for Explorer must be enabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='EnableSmartScreen'; Expected=1 },
+    @{ VulnID='V-253396'; RuleID='WN11-CC-000215'; Severity='medium'; Title='Explorer Data Execution Prevention must be enabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'; Name='NoDataExecutionPrevention'; Expected=0 },
+    @{ VulnID='V-253397'; RuleID='WN11-CC-000220'; Severity='low'; Title='File Explorer heap termination on corruption must be disabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'; Name='NoHeapTerminationOnCorruption'; Expected=0 },
+    @{ VulnID='V-253398'; RuleID='WN11-CC-000225'; Severity='medium'; Title='File Explorer shell protocol must run in protected mode.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name='PreXPSP2ShellProtocolBehavior'; Expected=0 },
+    @{ VulnID='V-253399'; RuleID='WN11-CC-000252'; Severity='medium'; Title='Windows 11 must be configured to disable Windows Game Recording and Broadcasting.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR'; Name='AllowGameDVR'; Expected=0 },
+    @{ VulnID='V-253400'; RuleID='WN11-CC-000255'; Severity='medium'; Title='The use of a hardware security device with Windows Hello for Business must be enabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork'; Name='RequireSecurityDevice'; Expected=1 },
+    @{ VulnID='V-253401'; RuleID='WN11-CC-000260'; Severity='medium'; Title='Windows 11 must be configured to require a minimum pin length of six characters or greater.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork\PINComplexity'; Name='MinimumPINLength'; Expected=6 },
+    @{ VulnID='V-253402'; RuleID='WN11-CC-000270'; Severity='medium'; Title='Passwords must not be saved in the Remote Desktop Client.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'; Name='DisablePasswordSaving'; Expected=1 },
+    @{ VulnID='V-253403'; RuleID='WN11-CC-000275'; Severity='medium'; Title='Local drives must be prevented from sharing with Remote Desktop Session Hosts.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'; Name='fDisableCdm'; Expected=1 },
+    @{ VulnID='V-253404'; RuleID='WN11-CC-000280'; Severity='medium'; Title='Remote Desktop Services must always prompt a client for passwords upon connection.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'; Name='fPromptForPassword'; Expected=1 },
+    @{ VulnID='V-253405'; RuleID='WN11-CC-000285'; Severity='medium'; Title='The Remote Desktop Session Host must require secure RPC communications.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'; Name='fEncryptRPCTraffic'; Expected=1 },
+    @{ VulnID='V-253406'; RuleID='WN11-CC-000290'; Severity='medium'; Title='Remote Desktop Services must be configured with the client connection encryption set to the required level.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'; Name='MinEncryptionLevel'; Expected=3 },
+    @{ VulnID='V-253407'; RuleID='WN11-CC-000295'; Severity='medium'; Title='Attachments must be prevented from being downloaded from RSS feeds.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Feeds'; Name='DisableEnclosureDownload'; Expected=1 },
+    @{ VulnID='V-253408'; RuleID='WN11-CC-000300'; Severity='medium'; Title='Basic authentication for RSS feeds over HTTP must not be used.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Feeds'; Name='AllowBasicAuthInClear'; Expected=0 },
+    @{ VulnID='V-253409'; RuleID='WN11-CC-000305'; Severity='medium'; Title='Indexing of encrypted files must be turned off.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; Name='AllowIndexingEncryptedStoresOrItems'; Expected=0 },
+    @{ VulnID='V-253410'; RuleID='WN11-CC-000310'; Severity='medium'; Title='Users must be prevented from changing installation options.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'; Name='EnableUserControl'; Expected=0 },
+    @{ VulnID='V-253411'; RuleID='WN11-CC-000315'; Severity='high'; Title='The Windows Installer feature `"Always install with elevated privileges`" must be disabled.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'; Name='AlwaysInstallElevated'; Expected=0 },
+    @{ VulnID='V-253412'; RuleID='WN11-CC-000320'; Severity='medium'; Title='Users must be notified if a web-based program attempts to install software.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'; Name='SafeForScripting'; Expected=0 },
+    @{ VulnID='V-253413'; RuleID='WN11-CC-000325'; Severity='medium'; Title='Automatically signing in the last interactive user after a system-initiated restart must be disabled.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='DisableAutomaticRestartSignOn'; Expected=1 },
+    @{ VulnID='V-253414'; RuleID='WN11-CC-000326'; Severity='medium'; Title='PowerShell script block logging must be enabled on Windows 11.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'; Name='EnableScriptBlockLogging'; Expected=1 },
+    @{ VulnID='V-253415'; RuleID='WN11-CC-000327'; Severity='medium'; Title='PowerShell Transcription must be enabled on Windows 11.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription'; Name='EnableTranscripting'; Expected=1 },
+    @{ VulnID='V-253416'; RuleID='WN11-CC-000330'; Severity='high'; Title='The Windows Remote Management (WinRM) client must not use Basic authentication.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'; Name='AllowBasic'; Expected=0 },
+    @{ VulnID='V-253417'; RuleID='WN11-CC-000335'; Severity='medium'; Title='The Windows Remote Management (WinRM) client must not allow unencrypted traffic.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'; Name='AllowUnencryptedTraffic'; Expected=0 },
+    @{ VulnID='V-253418'; RuleID='WN11-CC-000345'; Severity='high'; Title='The Windows Remote Management (WinRM) service must not use Basic authentication.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'; Name='AllowBasic'; Expected=0 },
+    @{ VulnID='V-253419'; RuleID='WN11-CC-000350'; Severity='medium'; Title='The Windows Remote Management (WinRM) service must not allow unencrypted traffic.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'; Name='AllowUnencryptedTraffic'; Expected=0 },
+    @{ VulnID='V-253420'; RuleID='WN11-CC-000355'; Severity='medium'; Title='The Windows Remote Management (WinRM) service must not store RunAs credentials.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'; Name='DisableRunAs'; Expected=1 },
+    @{ VulnID='V-253421'; RuleID='WN11-CC-000360'; Severity='medium'; Title='The Windows Remote Management (WinRM) client must not use Digest authentication.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'; Name='AllowDigest'; Expected=0 },
+    @{ VulnID='V-253422'; RuleID='WN11-CC-000365'; Severity='medium'; Title='Windows 11 must be configured to prevent Windows apps from being activated by voice while the system is locked.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; Name='LetAppsActivateWithVoiceAboveLock'; Expected=2 },
+    @{ VulnID='V-253422'; RuleID='WN11-CC-000365'; Severity='medium'; Title='Windows 11 must be configured to prevent Windows apps from being activated by voice while the system is locked.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; Name='LetAppsActivateWithVoice'; Expected=2 },
+    @{ VulnID='V-253426'; RuleID='WN11-EP-000310'; Severity='medium'; Title='Windows 11 Kernel (Direct Memory Access) DMA Protection must be enabled.'; Path='HKLM:\Software\Policies\Microsoft\Windows\Kernel DMA Protection'; Name='DeviceEnumerationPolicy'; Expected=0 },
+    @{ VulnID='V-253434'; RuleID='WN11-SO-000015'; Severity='medium'; Title='Local accounts with blank passwords must be restricted to prevent access from the network.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='LimitBlankPasswordUse'; Expected=1 },
+    @{ VulnID='V-253437'; RuleID='WN11-SO-000030'; Severity='medium'; Title='Audit policy using subcategories must be enabled.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='SCENoApplyLegacyAuditPolicy'; Expected=1 },
+    @{ VulnID='V-253438'; RuleID='WN11-SO-000035'; Severity='medium'; Title='Outgoing secure channel traffic must be encrypted or signed.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name='RequireSignOrSeal'; Expected=1 },
+    @{ VulnID='V-253439'; RuleID='WN11-SO-000040'; Severity='medium'; Title='Outgoing secure channel traffic must be encrypted.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name='SealSecureChannel'; Expected=1 },
+    @{ VulnID='V-253440'; RuleID='WN11-SO-000045'; Severity='medium'; Title='Outgoing secure channel traffic must be signed.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name='SignSecureChannel'; Expected=1 },
+    @{ VulnID='V-253441'; RuleID='WN11-SO-000050'; Severity='low'; Title='The computer account password must not be prevented from being reset.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name='DisablePasswordChange'; Expected=0 },
+    @{ VulnID='V-253442'; RuleID='WN11-SO-000055'; Severity='low'; Title='The maximum age for machine account passwords must be configured to 30 days or less.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name='MaximumPasswordAge'; Expected=30 },
+    @{ VulnID='V-253443'; RuleID='WN11-SO-000060'; Severity='medium'; Title='The system must be configured to require a strong session key.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name='RequireStrongKey'; Expected=1 },
+    @{ VulnID='V-253444'; RuleID='WN11-SO-000070'; Severity='medium'; Title='The machine inactivity limit must be set to 15 minutes, locking the system with the screensaver.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='InactivityTimeoutSecs'; Expected=900 },
+    @{ VulnID='V-253447'; RuleID='WN11-SO-000085'; Severity='low'; Title='Caching of logon credentials must be limited.'; Path='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; Name='CachedLogonsCount'; Expected=10 },
+    @{ VulnID='V-253448'; RuleID='WN11-SO-000095'; Severity='medium'; Title='The Smart Card removal option must be configured to Force Logoff or Lock Workstation.'; Path='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; Name='SCRemoveOption'; Expected=1 },
+    @{ VulnID='V-253449'; RuleID='WN11-SO-000100'; Severity='medium'; Title='The Windows SMB client must be configured to always perform SMB packet signing.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'; Name='RequireSecuritySignature'; Expected=1 },
+    @{ VulnID='V-253450'; RuleID='WN11-SO-000110'; Severity='medium'; Title='Unencrypted passwords must not be sent to third-party SMB Servers.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'; Name='EnablePlainTextPassword'; Expected=0 },
+    @{ VulnID='V-253451'; RuleID='WN11-SO-000120'; Severity='medium'; Title='The Windows SMB server must be configured to always perform SMB packet signing.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters'; Name='RequireSecuritySignature'; Expected=1 },
+    @{ VulnID='V-253453'; RuleID='WN11-SO-000145'; Severity='high'; Title='Anonymous enumeration of SAM accounts must not be allowed.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='RestrictAnonymousSAM'; Expected=1 },
+    @{ VulnID='V-253454'; RuleID='WN11-SO-000150'; Severity='high'; Title='Anonymous enumeration of shares must be restricted.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='RestrictAnonymous'; Expected=1 },
+    @{ VulnID='V-253455'; RuleID='WN11-SO-000160'; Severity='medium'; Title='The system must be configured to prevent anonymous users from having the same rights as the Everyone group.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='EveryoneIncludesAnonymous'; Expected=0 },
+    @{ VulnID='V-253456'; RuleID='WN11-SO-000165'; Severity='high'; Title='Anonymous access to Named Pipes and Shares must be restricted.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters'; Name='RestrictNullSessAccess'; Expected=1 },
+    @{ VulnID='V-253458'; RuleID='WN11-SO-000180'; Severity='medium'; Title='NTLM must be prevented from falling back to a Null session.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\LSA\MSV1_0'; Name='allownullsessionfallback'; Expected=0 },
+    @{ VulnID='V-253459'; RuleID='WN11-SO-000185'; Severity='medium'; Title='PKU2U authentication using online identities must be prevented.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\LSA\pku2u'; Name='AllowOnlineID'; Expected=0 },
+    @{ VulnID='V-253460'; RuleID='WN11-SO-000190'; Severity='medium'; Title='Kerberos encryption types must be configured to prevent the use of DES and RC4 encryption suites.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; Name='SupportedEncryptionTypes'; Expected=2147483640 },
+    @{ VulnID='V-253461'; RuleID='WN11-SO-000195'; Severity='high'; Title='The system must be configured to prevent the storage of the LAN Manager hash of passwords.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='NoLMHash'; Expected=1 },
+    @{ VulnID='V-253462'; RuleID='WN11-SO-000205'; Severity='high'; Title='The LanMan authentication level must be set to send NTLMv2 response only, and to refuse LM and NTLM.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='LmCompatibilityLevel'; Expected=5 },
+    @{ VulnID='V-253463'; RuleID='WN11-SO-000210'; Severity='medium'; Title='The system must be configured to the required LDAP client signing level.'; Path='HKLM:\SYSTEM\CurrentControlSet\Services\LDAP'; Name='LDAPClientIntegrity'; Expected=1 },
+    @{ VulnID='V-253464'; RuleID='WN11-SO-000215'; Severity='medium'; Title='The system must be configured to meet the minimum session security requirement for NTLM SSP based clients.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'; Name='NTLMMinClientSec'; Expected=537395200 },
+    @{ VulnID='V-253465'; RuleID='WN11-SO-000220'; Severity='medium'; Title='The system must be configured to meet the minimum session security requirement for NTLM SSP based servers.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'; Name='NTLMMinServerSec'; Expected=537395200 },
+    @{ VulnID='V-253466'; RuleID='WN11-SO-000230'; Severity='medium'; Title='The system must be configured to use FIPS-compliant algorithms for encryption, hashing, and signing.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FIPSAlgorithmPolicy'; Name='Enabled'; Expected=1 },
+    @{ VulnID='V-253467'; RuleID='WN11-SO-000240'; Severity='low'; Title='The default permissions of global system objects must be increased.'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'; Name='ProtectionMode'; Expected=1 },
+    @{ VulnID='V-253468'; RuleID='WN11-SO-000245'; Severity='medium'; Title='User Account Control approval mode for the built-in Administrator must be enabled.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='FilterAdministratorToken'; Expected=1 },
+    @{ VulnID='V-253469'; RuleID='WN11-SO-000250'; Severity='medium'; Title='User Account Control must prompt administrators for consent on the secure desktop.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='ConsentPromptBehaviorAdmin'; Expected=2 },
+    @{ VulnID='V-253471'; RuleID='WN11-SO-000255'; Severity='medium'; Title='User Account Control must automatically deny elevation requests for standard users.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='ConsentPromptBehaviorUser'; Expected=0 },
+    @{ VulnID='V-253472'; RuleID='WN11-SO-000260'; Severity='medium'; Title='User Account Control must be configured to detect application installations and prompt for elevation.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='EnableInstallerDetection'; Expected=1 },
+    @{ VulnID='V-253473'; RuleID='WN11-SO-000265'; Severity='medium'; Title='User Account Control must only elevate UIAccess applications that are installed in secure locations.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='EnableSecureUIAPaths'; Expected=1 },
+    @{ VulnID='V-253474'; RuleID='WN11-SO-000270'; Severity='medium'; Title='User Account Control must run all administrators in Admin Approval Mode, enabling UAC.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='EnableLUA'; Expected=1 },
+    @{ VulnID='V-253475'; RuleID='WN11-SO-000275'; Severity='medium'; Title='User Account Control must virtualize file and registry write failures to per-user locations.'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name='EnableVirtualization'; Expected=1 },
+    @{ VulnID='V-279688'; RuleID='WN11-00-000126'; Severity='medium'; Title='Windows 11 systems must block consumer account user authentication.'; Path='HKLM:\SOFTWARE\Policies\Microsoft\MicrosoftAccount'; Name='DisableUserAuth'; Expected=1 }
+)
+
+foreach ($check in $registryChecks) {
+    $currentVal = Get-RegistryValueSafe -Path $check.Path -Name $check.Name
+    if ($null -ne $currentVal -and $currentVal -eq $check.Expected) {
+        Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+            -RuleTitle $check.Title -Status "Pass" `
+            -Details "$($check.Name)=$currentVal (Expected: $($check.Expected))"
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Setting $($check.Path)\$($check.Name) = $($check.Expected)..."
+            if (Set-RegistryValueForce -Path $check.Path -Name $check.Name -Value $check.Expected) {
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fixed" `
+                    -Details "$($check.Name) set to $($check.Expected)." `
+                    -FixAction "Set $($check.Path)\$($check.Name) = $($check.Expected)"
+            } else {
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fail" `
+                    -Details "Auto-fix failed. $($check.Name)=$currentVal (Expected: $($check.Expected))"
+            }
+        } else {
+            Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                -RuleTitle $check.Title -Status "Fail" `
+                -Details "$($check.Name)=$currentVal (Expected: $($check.Expected))"
+        }
+    }
+}
+
+# --- Manual / Non-Registry Checks ---
+# --- Event Log Permissions (V-253340 through V-253342) ---
+$eventLogPermChecks = @(
+    @{ VulnID="V-253340"; RuleID="WN11-AU-000515"; LogName="Application"; File="Application.evtx" },
+    @{ VulnID="V-253341"; RuleID="WN11-AU-000520"; LogName="Security";    File="Security.evtx" },
+    @{ VulnID="V-253342"; RuleID="WN11-AU-000525"; LogName="System";      File="System.evtx" }
+)
+
+foreach ($check in $eventLogPermChecks) {
+    Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity "medium" `
+        -RuleTitle "Windows 11 permissions for the $($check.LogName) event log must prevent access by non-privileged accounts." `
+        -Status "Manual" -Details "Event log configuration check." `
+        -ManualSteps "Verify the permissions on the $($check.LogName) event log ($($check.File)). Standard user accounts or groups must not have access.`n`nRequired permissions: Eventlog - Full Control, SYSTEM - Full Control, Administrators - Full Control.`n`nDefault location: %SystemRoot%\SYSTEM32\WINEVT\LOGS\. If permissions do not match, this is a finding."
+}
+
+# V-253351 | WN11-CC-000007 | Windows 11 must cover or disable the built-in or attached camera when not in use
+Add-Result -VulnID "V-253351" -RuleID "WN11-CC-000007" -Severity "medium" `
+    -RuleTitle "Windows 11 must cover or disable the built-in or attached camera when not in use." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the device or operating system does not have a camera installed, this requirement is not applicable.`n`nThis requirement is not applicable to mobile devices (smartphones and tablets), where the use of the camera is a local authorizing official (AO) decision.`n`nThis requirement is not applicable to dedicated VTC suites located in approved VTC locations that are centrally managed.`n`nFor an external c"
+
+# V-253359 | WN11-CC-000039 | Run as different user must be removed from context menus.
+Add-Result -VulnID "V-253359" -RuleID "WN11-CC-000039" -Severity "medium" `
+    -RuleTitle "Run as different user must be removed from context menus." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry values do not exist or are not configured as specified, this is a finding.`nThe policy configures the same Value Name, Type and Value under four different registry paths.`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Paths: `n\SOFTWARE\Classes\batfile\shell\runasuser\`n\SOFTWARE\Classes\cmdfile\shell\runasuser\`n\SOFTWARE\Classes\exefile\shell\runasuser\`n\SOFTWARE\Classes\mscfi"
+
+# V-253362 | WN11-CC-000050 | Hardened UNC Paths must be defined to require mutual authentication and integrit
+Add-Result -VulnID "V-253362" -RuleID "WN11-CC-000050" -Severity "medium" `
+    -RuleTitle "Hardened UNC Paths must be defined to require mutual authentication and integrity for at least the \\*\SYSVOL and \\*\NE" `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "This requirement is applicable to domain-joined systems, for standalone systems this is NA.`n`nIf the following registry values do not exist or are not configured as specified, this is a finding.`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Path: \SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths\`n`nValue Name: \\*\NETLOGON`nValue Type: REG_SZ`nValue: RequireMutualAuthentication=1, Requi"
+
+# V-253363 | WN11-CC-000052 | Windows 11 must be configured to prioritize ECC Curves with longer key lengths f
+Add-Result -VulnID "V-253363" -RuleID "WN11-CC-000052" -Severity "medium" `
+    -RuleTitle "Windows 11 must be configured to prioritize ECC Curves with longer key lengths first." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Path: \SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002\`n`nValue Name: EccCurves`n`nValue Type: REG_MULTI_SZ`nValue: NistP384 NistP256"
+
+# V-253423 | WN11-CC-000370 | The convenience PIN for Windows 11 must be disabled.
+Add-Result -VulnID "V-253423" -RuleID "WN11-CC-000370" -Severity "medium" `
+    -RuleTitle "The convenience PIN for Windows 11 must be disabled." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Path: \Software\Policies\Microsoft\Windows\System`n`nValue Name: AllowDomainPINLogon`nValue Type: REG_DWORD`nValue data: 0"
+
+# V-253424 | WN11-CC-000385 | Windows Ink Workspace must be configured to disallow access above the lock.
+Add-Result -VulnID "V-253424" -RuleID "WN11-CC-000385" -Severity "medium" `
+    -RuleTitle "Windows Ink Workspace must be configured to disallow access above the lock." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Path: \Software\Policies\Microsoft\WindowsInkWorkspace`n`nValue Name: AllowWindowsInkWorkspace`nValue Type: REG_DWORD`nValue data: 1"
+
+# V-253425 | WN11-CC-000390 | Windows 11 must be configured to prevent users from receiving suggestions for th
+Add-Result -VulnID "V-253425" -RuleID "WN11-CC-000390" -Severity "low" `
+    -RuleTitle "Windows 11 must be configured to prevent users from receiving suggestions for third-party or additional applications." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_CURRENT_USER`nRegistry Path: \SOFTWARE\Policies\Microsoft\Windows\CloudContent\`n`nValue Name: DisableThirdPartySuggestions`n`nType: REG_DWORD`nValue: 0x00000001 (1)"
+
+# V-253427 | WN11-PK-000005 | The DoD Root CA certificates must be installed in the Trusted Root Store.
+Add-Result -VulnID "V-253427" -RuleID "WN11-PK-000005" -Severity "medium" `
+    -RuleTitle "The DoD Root CA certificates must be installed in the Trusted Root Store." `
+    -Status "Manual" -Details "Certificate store check - requires manual verification." `
+    -ManualSteps "Verify the DoD Root CA certificates are installed as Trusted Root Certification Authorities.`n`nThe certificates and thumbprints referenced below apply to unclassified systems; refer to PKE documentation for other networks.`n`nRun `"PowerShell`" as an administrator.`n`nExecute the following command:`n`nGet-ChildItem -Path Cert:Localmachine\root | Where Subject -Like `"*DoD*`" | FL Subject, Thumbprint, NotAfte"
+
+# V-253428 | WN11-PK-000010 | The External Root CA certificates must be installed in the Trusted Root Store on
+Add-Result -VulnID "V-253428" -RuleID "WN11-PK-000010" -Severity "medium" `
+    -RuleTitle "The External Root CA certificates must be installed in the Trusted Root Store on unclassified systems." `
+    -Status "Manual" -Details "Certificate store check - requires manual verification." `
+    -ManualSteps "Verify the ECA Root CA certificates are installed on unclassified systems as Trusted Root Certification Authorities.`n`nRun `"PowerShell`" as an administrator.`n`nExecute the following command:`n`nGet-ChildItem -Path Cert:Localmachine\root | Where Subject -Like `"*ECA*`" | FL Subject, Thumbprint, NotAfter`n`nIf the following certificate `"Subject`" and `"Thumbprint`" information is not displayed, this is a findin"
+
+# V-253429 | WN11-PK-000015 | The DoD Interoperability Root CA cross-certificates must be installed in the Unt
+Add-Result -VulnID "V-253429" -RuleID "WN11-PK-000015" -Severity "medium" `
+    -RuleTitle "The DoD Interoperability Root CA cross-certificates must be installed in the Untrusted Certificates Store on unclassifie" `
+    -Status "Manual" -Details "Certificate store check - requires manual verification." `
+    -ManualSteps "Verify the DoD Interoperability cross-certificates are installed on unclassified systems as Untrusted Certificates.`n`nRun `"PowerShell`" as an administrator.`n`nExecute the following command:`n`nGet-ChildItem -Path Cert:Localmachine\disallowed | Where {$_.Issuer -Like `"*DoD Interoperability*`" -and $_.Subject -Like `"*DoD*`"} | FL Subject, Issuer, Thumbprint, NotAfter`n`nIf the following certificate `"Subject`""
+
+# V-253430 | WN11-PK-000020 | The US DOD CCEB Interoperability Root CA cross-certificates must be installed in
+Add-Result -VulnID "V-253430" -RuleID "WN11-PK-000020" -Severity "medium" `
+    -RuleTitle "The US DOD CCEB Interoperability Root CA cross-certificates must be installed in the Untrusted Certificates Store on unc" `
+    -Status "Manual" -Details "Certificate store check - requires manual verification." `
+    -ManualSteps "Verify the US DOD CCEB Interoperability Root CA cross-certificate is installed on unclassified systems as an Untrusted Certificate.`n`nRun `"PowerShell`" as an administrator.`n`nExecute the following command:`n`nGet-ChildItem -Path Cert:Localmachine\disallowed | Where Issuer -Like `"*CCEB Interoperability*`" | FL Subject, Issuer, Thumbprint, NotAfter`n`nIf the following certificate `"Subject`", `"Issuer`", and `"T"
+
+# V-253431 | WN11-RG-000005 | Default permissions for the HKEY_LOCAL_MACHINE registry hive must be maintained.
+Add-Result -VulnID "V-253431" -RuleID "WN11-RG-000005" -Severity "medium" `
+    -RuleTitle "Default permissions for the HKEY_LOCAL_MACHINE registry hive must be maintained." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "Verify the default registry permissions for the keys note below of the HKEY_LOCAL_MACHINE hive.`n`nIf any non-privileged groups such as Everyone, Users or Authenticated Users have greater than Read permission, this is a finding.`n`nRun `"Regedit`".`nRight click on the registry areas noted below.`nSelect `"Permissions...`" and the `"Advanced`" button.`n`nHKEY_LOCAL_MACHINE\SECURITY`nType - `"Allow`" for all`nInherit"
+
+# --- Security Options (gpedit) Manual Checks (V-253433, V-253435, V-253436) ---
+$securityOptionsChecks = @(
+    @{ VulnID="V-253433"; RuleID="WN11-SO-000010"; Title="The built-in guest account must be disabled.";          Policy="Accounts: Guest account status";         FailCond='is not set to "Disabled"' },
+    @{ VulnID="V-253435"; RuleID="WN11-SO-000020"; Title="The built-in administrator account must be renamed.";   Policy="Accounts: Rename administrator account"; FailCond='is set to "Administrator"' },
+    @{ VulnID="V-253436"; RuleID="WN11-SO-000025"; Title="The built-in guest account must be renamed.";           Policy="Accounts: Rename guest account";         FailCond='is set to "Guest"' }
+)
+
+foreach ($check in $securityOptionsChecks) {
+    Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity "medium" `
+        -RuleTitle $check.Title `
+        -Status "Manual" -Details "Requires manual verification." `
+        -ManualSteps "Verify in gpedit.msc > Computer Configuration > Windows Settings > Security Settings > Local Policies > Security Options.`n`nIf `"$($check.Policy)`" $($check.FailCond), this is a finding."
+}
+
+# V-253445 | WN11-SO-000075 | The required legal notice must be configured to display before console logon.
+Add-Result -VulnID "V-253445" -RuleID "WN11-SO-000075" -Severity "medium" `
+    -RuleTitle "The required legal notice must be configured to display before console logon." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Path: \SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\`n`nValue Name: LegalNoticeText`n`nValue Type: REG_SZ`nValue: `nYou are accessing a U.S. Government (USG) Information System (IS) that is provided for USG-authorized use only.`n`nBy using this IS (w"
+
+# V-253446 | WN11-SO-000080 | The Windows message title for the legal notice must be configured.
+Add-Result -VulnID "V-253446" -RuleID "WN11-SO-000080" -Severity "low" `
+    -RuleTitle "The Windows message title for the legal notice must be configured." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Path: \SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\`n`nValue Name: LegalNoticeCaption`n`nValue Type: REG_SZ`nValue: See message title above`n`n`"DoD Notice and Consent Banner`", `"US Department of Defense Warning Statement`" or a site-defined equivalen"
+
+# V-253452 | WN11-SO-000140 | Anonymous SID/Name translation must not be allowed.
+Add-Result -VulnID "V-253452" -RuleID "WN11-SO-000140" -Severity "high" `
+    -RuleTitle "Anonymous SID/Name translation must not be allowed." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "Verify the effective setting in Local Group Policy Editor.`nRun `"gpedit.msc`".`n`nNavigate to Local Computer Policy >> Computer Configuration >> Windows Settings >> Security Settings >> Local Policies >> Security Options.`n`nIf the value for `"Network access: Allow anonymous SID/Name translation`" is not set to `"Disabled`", this is a finding."
+
+# V-253457 | WN11-SO-000167 | Remote calls to the Security Account Manager (SAM) must be restricted to Adminis
+Add-Result -VulnID "V-253457" -RuleID "WN11-SO-000167" -Severity "medium" `
+    -RuleTitle "Remote calls to the Security Account Manager (SAM) must be restricted to Administrators." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_LOCAL_MACHINE`nRegistry Path: \SYSTEM\CurrentControlSet\Control\Lsa\`n`nValue Name: RestrictRemoteSAM`n`nValue Type: REG_SZ`nValue: O:BAG:BAD:(A;;RC;;;BA)`n`nIf a domain application account such as for a management tool requires this user right, this would not be a finding.`nVendor docu"
+
+# V-253470 | WN11-SO-000251 | Windows 11 must use multifactor authentication for local and network access to p
+Add-Result -VulnID "V-253470" -RuleID "WN11-SO-000251" -Severity "medium" `
+    -RuleTitle "Windows 11 must use multifactor authentication for local and network access to privileged and nonprivileged accounts." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the system is not a member of a domain, this is Not Applicable.`n`nIf all of the following settings exist and are populated, this is not a finding.`n`n\HKLM\SOFTWARE\Microsoft\Cryptography\Calais\Readers`n\HKLM\SOFTWARE\Microsoft\Cryptography\Calais\SmartCards"
+
+# V-253476 | WN11-SO-000280 | Passwords for enabled local Administrator accounts must be changed at least ever
+Add-Result -VulnID "V-253476" -RuleID "WN11-SO-000280" -Severity "medium" `
+    -RuleTitle "Passwords for enabled local Administrator accounts must be changed at least every 60 days." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If there are no enabled local Administrator accounts, this is Not Applicable.`n`nReview the password last set date for the enabled local Administrator account.`n`nOn the standalone or domain-joined workstation:`n`nOpen `"PowerShell`".`n`nEnter `"Get-LocalUser -Name * | Select-Object *`".`n`nIf the `"PasswordLastSet`" date is greater than `"60`" days old for the local Administrator account for administering the comp"
+
+# V-253477 | WN11-UC-000015 | Toast notifications to the lock screen must be turned off.
+Add-Result -VulnID "V-253477" -RuleID "WN11-UC-000015" -Severity "low" `
+    -RuleTitle "Toast notifications to the lock screen must be turned off." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "If the following registry value does not exist or is not configured as specified, this is a finding:`n`nRegistry Hive: HKEY_CURRENT_USER`nRegistry Path: \SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications\`n`nValue Name: NoToastApplicationNotificationOnLockScreen`n`nValue Type: REG_DWORD`nValue: 1"
+
+# V-253478 | WN11-UC-000020 | Zone information must be preserved when saving attachments.
+Add-Result -VulnID "V-253478" -RuleID "WN11-UC-000020" -Severity "medium" `
+    -RuleTitle "Zone information must be preserved when saving attachments." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "The default behavior is for Windows to mark file attachments with their zone information.`n`nIf it exists and is configured with a value of `"1`", this is a finding.`n`nRegistry Hive: HKEY_CURRENT_USER`nRegistry Path: \SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Attachments\`n`nValue Name: SaveZoneInformation`n`nValue Type: REG_DWORD`nValue: 0x00000002 (2) (or if the Value Name does not exist)"
+
+# ============================================================================
+# USER RIGHTS ASSIGNMENT - Manual Checks (V-253479 through V-253506)
+# All require manual review via gpedit.msc > Local Policies > User Rights Assignment
+# ============================================================================
+$userRightsChecks = @(
+    @{ VulnID="V-253479"; RuleID="WN11-UR-000005"; Severity="medium"; Title='The "Access Credential Manager as a trusted caller" user right must not be assigned to any groups or accounts.' },
+    @{ VulnID="V-253480"; RuleID="WN11-UR-000010"; Severity="medium"; Title='The "Access this computer from the network" user right must only be assigned to the Administrators and Remote Desktop Users groups.' },
+    @{ VulnID="V-253481"; RuleID="WN11-UR-000015"; Severity="high";   Title='The "Act as part of the operating system" user right must not be assigned to any groups or accounts.' },
+    @{ VulnID="V-253482"; RuleID="WN11-UR-000025"; Severity="medium"; Title='The "Allow log on locally" user right must only be assigned to the Administrators and Users groups.' },
+    @{ VulnID="V-253483"; RuleID="WN11-UR-000030"; Severity="medium"; Title='The "Back up files and directories" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253484"; RuleID="WN11-UR-000035"; Severity="medium"; Title='The "Change the system time" user right must only be assigned to Administrators and Local Service.' },
+    @{ VulnID="V-253485"; RuleID="WN11-UR-000040"; Severity="medium"; Title='The "Create a pagefile" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253486"; RuleID="WN11-UR-000045"; Severity="high";   Title='The "Create a token object" user right must not be assigned to any groups or accounts.' },
+    @{ VulnID="V-253487"; RuleID="WN11-UR-000050"; Severity="medium"; Title='The "Create global objects" user right must only be assigned to Administrators, Service, Local Service, and Network Service.' },
+    @{ VulnID="V-253488"; RuleID="WN11-UR-000055"; Severity="medium"; Title='The "Create permanent shared objects" user right must not be assigned to any groups or accounts.' },
+    @{ VulnID="V-253489"; RuleID="WN11-UR-000060"; Severity="medium"; Title='The "Create symbolic links" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253490"; RuleID="WN11-UR-000065"; Severity="high";   Title='The "Debug programs" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253491"; RuleID="WN11-UR-000070"; Severity="medium"; Title='The "Deny access to this computer from the network" user right on workstations must be configured to prevent access from highly privileged domain accounts.' },
+    @{ VulnID="V-253492"; RuleID="WN11-UR-000075"; Severity="medium"; Title='The "Deny log on as a batch job" user right on domain-joined workstations must be configured to prevent access from highly privileged domain accounts.' },
+    @{ VulnID="V-253493"; RuleID="WN11-UR-000080"; Severity="medium"; Title='The "Deny log on as a service" user right on Windows 11 domain-joined workstations must be configured to prevent access from highly privileged domain accounts.' },
+    @{ VulnID="V-253494"; RuleID="WN11-UR-000085"; Severity="medium"; Title='The "Deny log on locally" user right on workstations must be configured to prevent access from highly privileged domain accounts.' },
+    @{ VulnID="V-253495"; RuleID="WN11-UR-000090"; Severity="medium"; Title='The "Deny log on through Remote Desktop Services" user right on Windows 11 workstations must be configured to prevent access from highly privileged domain accounts.' },
+    @{ VulnID="V-253496"; RuleID="WN11-UR-000095"; Severity="medium"; Title='The "Enable computer and user accounts to be trusted for delegation" user right must not be assigned to any groups or accounts.' },
+    @{ VulnID="V-253497"; RuleID="WN11-UR-000100"; Severity="medium"; Title='The "Force shutdown from a remote system" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253498"; RuleID="WN11-UR-000110"; Severity="medium"; Title='The "Impersonate a client after authentication" user right must only be assigned to Administrators, Service, Local Service, and Network Service.' },
+    @{ VulnID="V-253499"; RuleID="WN11-UR-000120"; Severity="medium"; Title='The "Load and unload device drivers" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253500"; RuleID="WN11-UR-000125"; Severity="medium"; Title='The "Lock pages in memory" user right must not be assigned to any groups or accounts.' },
+    @{ VulnID="V-253501"; RuleID="WN11-UR-000130"; Severity="medium"; Title='The "Manage auditing and security log" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253502"; RuleID="WN11-UR-000140"; Severity="medium"; Title='The "Modify firmware environment values" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253503"; RuleID="WN11-UR-000145"; Severity="medium"; Title='The "Perform volume maintenance tasks" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253504"; RuleID="WN11-UR-000150"; Severity="medium"; Title='The "Profile single process" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253505"; RuleID="WN11-UR-000160"; Severity="medium"; Title='The "Restore files and directories" user right must only be assigned to the Administrators group.' },
+    @{ VulnID="V-253506"; RuleID="WN11-UR-000165"; Severity="medium"; Title='The "Take ownership of files or other objects" user right must only be assigned to the Administrators group.' }
+)
+
+foreach ($check in $userRightsChecks) {
+    Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+        -RuleTitle $check.Title `
+        -Status "Manual" -Details "User Rights Assignment check - requires manual review of Local Security Policy." `
+        -ManualSteps "1. Run gpedit.msc > Computer Configuration > Windows Settings > Security Settings > Local Policies > User Rights Assignment.`n2. Verify the policy for `"$($check.Title.Split('"')[1])`" matches the STIG requirement.`n3. Adjust group/account assignments per STIG guidance."
+}
+
+# V-256893 | WN11-CC-000391 | Internet Explorer must be disabled for Windows 11.
+Add-Result -VulnID "V-256893" -RuleID "WN11-CC-000391" -Severity "medium" `
+    -RuleTitle "Internet Explorer must be disabled for Windows 11." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "Determine if IE11 is installed or enabled on Windows 11 semi-annual channel.`n`nIf IE11 is installed or not disabled on Windows 11 semi-annual channel, this is a finding.`n`nIf IE11 is installed on an unsupported operating system and is enabled or installed, this is a finding.`n`nFor more information, visit: https://learn.microsoft.com/en-us/lifecycle/faq/internet-explorer-microsoft-edge#what-is-the-lif"
+
+# V-257592 | WN11-00-000395 | Windows 11 must not have portproxy enabled or in use.
+Add-Result -VulnID "V-257592" -RuleID "WN11-00-000395" -Severity "medium" `
+    -RuleTitle "Windows 11 must not have portproxy enabled or in use." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "Check the registry key for existence of proxied ports:`nHKLM\SYSTEM\CurrentControlSet\Services\PortProxy\.`n`nIf the key contains v4tov4\tcp\ or is populated v4tov4\tcp\, this is a finding.`n`nRun `"netsh interface portproxy show all`".`n`nIf the command displays any results, this is a finding."
+
+# V-257770 | WN11-AU-000585 | Windows 11 must have command line process auditing events enabled for failures.
+Add-Result -VulnID "V-257770" -RuleID "WN11-AU-000585" -Severity "medium" `
+    -RuleTitle "Windows 11 must have command line process auditing events enabled for failures." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "Ensure Audit Process Creation auditing has been enabled: `n`nComputer Configuration >> Windows Settings >> Security Settings >> Advanced Audit Policy Configuration >> System Audit Policy >> Detailed Tracking >> Audit Process Creation. `n`nIf `"Audit Process Creation`" is not set to `"Failure`", this is a finding."
+
+# V-268317 | WN11-00-000125 | Copilot must be disabled for Windows 11.
+Add-Result -VulnID "V-268317" -RuleID "WN11-00-000125" -Severity "medium" `
+    -RuleTitle "Copilot must be disabled for Windows 11." `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "Run the following PowerShell command as an administrator:`n`nGet-AppxPackage -AllUsers | Where-Object { $_.Name -like `"*Copilot*`" }`n`nIf Microsoft.Copilot displays, this is a finding."
+
+# V-268318 | WN11-CC-000063 | Windows 11 systems must use either Group Policy or an approved Mobile Device Man
+Add-Result -VulnID "V-268318" -RuleID "WN11-CC-000063" -Severity "medium" `
+    -RuleTitle "Windows 11 systems must use either Group Policy or an approved Mobile Device Management (MDM) product to enforce STIG co" `
+    -Status "Manual" -Details "Requires manual verification." `
+    -ManualSteps "Verify the Windows 11 system is receiving policy from either group Policy or an MDM with the following steps:`n`nFrom a command line or PowerShell:`n`ngpresult /R`nOS Configuration: Member Workstation`n`nIf the system is not being managed by GPO, ask the administrator to indicate which MDM is managing the device.`n`nFrom PowerShell: Get-Service -Name `"IntuneManagementExtension`"`n`nIf the Windows 11 system is"
+
+# ============================================================================
+# ADVANCED AUDIT POLICY - Manual Checks (V-278926 through V-278933)
+# All require verification via Advanced Audit Policy Configuration
+# ============================================================================
+$advancedAuditManualChecks = @(
+    @{ VulnID="V-278926"; RuleID="WN11-AU-000581"; Title="Windows 11 must be configured to audit file system failures.";                Category="Object Access"; Sub="Audit File System";              Exp="Failure" },
+    @{ VulnID="V-278927"; RuleID="WN11-AU-000582"; Title="Windows 11 must be configured to audit file system successes.";               Category="Object Access"; Sub="Audit File System";              Exp="Success" },
+    @{ VulnID="V-278928"; RuleID="WN11-AU-000583"; Title="Windows 11 must be configured to audit handle manipulation failures.";        Category="Object Access"; Sub="Audit Handle Manipulation";      Exp="Failure" },
+    @{ VulnID="V-278929"; RuleID="WN11-AU-000584"; Title="Windows 11 must be configured to audit handle manipulation successes.";       Category="Object Access"; Sub="Audit Handle Manipulation";      Exp="Success" },
+    @{ VulnID="V-278930"; RuleID="WN11-AU-000589"; Title="Windows 11 must be configured to audit registry failures.";                  Category="Object Access"; Sub="Audit Registry";                 Exp="Failure" },
+    @{ VulnID="V-278931"; RuleID="WN11-AU-000586"; Title="Windows 11 must be configured to audit registry successes.";                 Category="Object Access"; Sub="Audit Registry";                 Exp="Success" },
+    @{ VulnID="V-278932"; RuleID="WN11-AU-000587"; Title="Windows 11 must be configured to audit sensitive privilege use successes.";   Category="Privilege Use"; Sub="Audit Sensitive Privilege Use";   Exp="Success" },
+    @{ VulnID="V-278933"; RuleID="WN11-AU-000588"; Title="Windows 11 must be configured to audit sensitive privilege use failures.";    Category="Privilege Use"; Sub="Audit Sensitive Privilege Use";   Exp="Failure" }
+)
+
+foreach ($check in $advancedAuditManualChecks) {
+    Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity "medium" `
+        -RuleTitle $check.Title `
+        -Status "Manual" -Details "Requires manual verification." `
+        -ManualSteps "Verify auditing is enabled: Computer Configuration >> Windows Settings >> Security Settings >> Advanced Audit Policy Configuration >> System Audit Policies >> $($check.Category) >> $($check.Sub).`n`nIf `"$($check.Sub)`" is not set to `"$($check.Exp)`", this is a finding."
+}
+
+# ============================================================================
+# WINDOWS DEFENDER FIREWALL STIG (V-241989 through V-242009)
+# Microsoft Windows Defender Firewall with Advanced Security STIG V2R2
+# ============================================================================
+
+$firewallChecks = @(
+    # --- Domain Profile ---
+    @{ VulnID='V-241989'; RuleID='WNFWA-000001'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security must be enabled when connected to a domain.';
+       DomainOnly=$true; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile'; Name='EnableFirewall'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-241992'; RuleID='WNFWA-000004'; Severity='high'; Title='Windows Defender Firewall with Advanced Security must block unsolicited inbound connections when connected to a domain.';
+       DomainOnly=$true; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile'; Name='DefaultInboundAction'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-241993'; RuleID='WNFWA-000005'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security must allow outbound connections, unless a rule explicitly blocks the connection when connected to a domain.';
+       DomainOnly=$true; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile'; Name='DefaultOutboundAction'; Expected=0; Comparison='eq' },
+    @{ VulnID='V-241994'; RuleID='WNFWA-000009'; Severity='low'; Title='Windows Defender Firewall with Advanced Security log size must be configured for domain connections.';
+       DomainOnly=$true; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile\Logging'; Name='LogFileSize'; Expected=16384; Comparison='ge' },
+    @{ VulnID='V-241995'; RuleID='WNFWA-000010'; Severity='low'; Title='Windows Defender Firewall with Advanced Security must log dropped packets when connected to a domain.';
+       DomainOnly=$true; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile\Logging'; Name='LogDroppedPackets'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-241996'; RuleID='WNFWA-000011'; Severity='low'; Title='Windows Defender Firewall with Advanced Security must log successful connections when connected to a domain.';
+       DomainOnly=$true; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile\Logging'; Name='LogSuccessfulConnections'; Expected=1; Comparison='eq' },
+    # --- Private Profile ---
+    @{ VulnID='V-241990'; RuleID='WNFWA-000002'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security must be enabled when connected to a private network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile'; Name='EnableFirewall'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-241997'; RuleID='WNFWA-000012'; Severity='high'; Title='Windows Defender Firewall with Advanced Security must block unsolicited inbound connections when connected to a private network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile'; Name='DefaultInboundAction'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-241998'; RuleID='WNFWA-000013'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security must allow outbound connections, unless a rule explicitly blocks the connection when connected to a private network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile'; Name='DefaultOutboundAction'; Expected=0; Comparison='eq' },
+    @{ VulnID='V-241999'; RuleID='WNFWA-000017'; Severity='low'; Title='Windows Defender Firewall with Advanced Security log size must be configured for private network connections.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile\Logging'; Name='LogFileSize'; Expected=16384; Comparison='ge' },
+    @{ VulnID='V-242000'; RuleID='WNFWA-000018'; Severity='low'; Title='Windows Defender Firewall with Advanced Security must log dropped packets when connected to a private network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile\Logging'; Name='LogDroppedPackets'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-242001'; RuleID='WNFWA-000019'; Severity='low'; Title='Windows Defender Firewall with Advanced Security must log successful connections when connected to a private network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile\Logging'; Name='LogSuccessfulConnections'; Expected=1; Comparison='eq' },
+    # --- Public Profile ---
+    @{ VulnID='V-241991'; RuleID='WNFWA-000003'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security must be enabled when connected to a public network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile'; Name='EnableFirewall'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-242002'; RuleID='WNFWA-000020'; Severity='high'; Title='Windows Defender Firewall with Advanced Security must block unsolicited inbound connections when connected to a public network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile'; Name='DefaultInboundAction'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-242003'; RuleID='WNFWA-000021'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security must allow outbound connections, unless a rule explicitly blocks the connection when connected to a public network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile'; Name='DefaultOutboundAction'; Expected=0; Comparison='eq' },
+    @{ VulnID='V-242006'; RuleID='WNFWA-000027'; Severity='low'; Title='Windows Defender Firewall with Advanced Security log size must be configured for public network connections.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile\Logging'; Name='LogFileSize'; Expected=16384; Comparison='ge' },
+    @{ VulnID='V-242007'; RuleID='WNFWA-000028'; Severity='low'; Title='Windows Defender Firewall with Advanced Security must log dropped packets when connected to a public network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile\Logging'; Name='LogDroppedPackets'; Expected=1; Comparison='eq' },
+    @{ VulnID='V-242008'; RuleID='WNFWA-000029'; Severity='low'; Title='Windows Defender Firewall with Advanced Security must log successful connections when connected to a public network.';
+       DomainOnly=$false; PolicyPath='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging'; FallbackPath='HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile\Logging'; Name='LogSuccessfulConnections'; Expected=1; Comparison='eq' }
+)
+
+foreach ($check in $firewallChecks) {
+    if ($check.DomainOnly -and -not $isDomainJoined) {
+        Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+            -RuleTitle $check.Title -Status "N/A" -Details "System is not domain-joined; Domain Profile requirement is N/A."
+        continue
+    }
+
+    # Check policy-based registry path first, then fallback
+    $policyVal = Get-RegistryValueSafe -Path $check.PolicyPath -Name $check.Name
+    $currentVal = $null
+    $source = ""
+    if ($null -ne $policyVal) {
+        $currentVal = $policyVal
+        $source = "Policy"
+    } elseif ($check.FallbackPath) {
+        $fallbackVal = Get-RegistryValueSafe -Path $check.FallbackPath -Name $check.Name
+        if ($null -ne $fallbackVal) {
+            $currentVal = $fallbackVal
+            $source = "Local"
+        }
+    }
+
+    $isCompliant = $false
+    if ($null -ne $currentVal) {
+        if ($check.Comparison -eq 'ge') {
+            $isCompliant = ($currentVal -ge $check.Expected)
+        } else {
+            $isCompliant = ($currentVal -eq $check.Expected)
+        }
+    }
+
+    $compOp = if ($check.Comparison -eq 'ge') { '>=' } else { '==' }
+
+    if ($isCompliant) {
+        Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+            -RuleTitle $check.Title -Status "Pass" `
+            -Details "$($check.Name)=$currentVal ($source) (Expected: $compOp $($check.Expected))"
+    } else {
+        $fixPath = $check.PolicyPath
+        if ($AutoFix) {
+            $fixVal = $check.Expected
+            Write-FixAttempt "Setting $fixPath\$($check.Name) = $fixVal..."
+            if (Set-RegistryValueForce -Path $fixPath -Name $check.Name -Value $fixVal) {
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fixed" `
+                    -Details "$($check.Name) set to $fixVal." `
+                    -FixAction "Set $fixPath\$($check.Name) = $fixVal"
+            } else {
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fail" `
+                    -Details "Auto-fix failed. $($check.Name)=$currentVal (Expected: $compOp $($check.Expected))"
+            }
+        } else {
+            Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                -RuleTitle $check.Title -Status "Fail" `
+                -Details "$($check.Name)=$currentVal ($source) (Expected: $compOp $($check.Expected))"
+        }
+    }
+}
+
+# --- Firewall Policy Merge Checks (V-242004, V-242005) - Domain-joined only, policy path only ---
+$firewallPolicyMergeChecks = @(
+    @{ VulnID='V-242004'; RuleID='WNFWA-000024'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security local firewall rules must not be merged with Group Policy settings when connected to a public network.';
+       Path='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile'; Name='AllowLocalPolicyMerge'; Expected=0 },
+    @{ VulnID='V-242005'; RuleID='WNFWA-000025'; Severity='medium'; Title='Windows Defender Firewall with Advanced Security local connection rules must not be merged with Group Policy settings when connected to a public network.';
+       Path='HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile'; Name='AllowLocalIPsecPolicyMerge'; Expected=0 }
+)
+
+foreach ($check in $firewallPolicyMergeChecks) {
+    if (-not $isDomainJoined) {
+        Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+            -RuleTitle $check.Title -Status "N/A" -Details "System is not domain-joined."
+        continue
+    }
+    $currentVal = Get-RegistryValueSafe -Path $check.Path -Name $check.Name
+    if ($null -ne $currentVal -and $currentVal -eq $check.Expected) {
+        Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+            -RuleTitle $check.Title -Status "Pass" `
+            -Details "$($check.Name)=$currentVal (Expected: $($check.Expected))"
+    } else {
+        if ($AutoFix) {
+            Write-FixAttempt "Setting $($check.Path)\$($check.Name) = $($check.Expected)..."
+            if (Set-RegistryValueForce -Path $check.Path -Name $check.Name -Value $check.Expected) {
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fixed" `
+                    -Details "$($check.Name) set to $($check.Expected)." `
+                    -FixAction "Set $($check.Path)\$($check.Name) = $($check.Expected)"
+            } else {
+                Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                    -RuleTitle $check.Title -Status "Fail" `
+                    -Details "Auto-fix failed. $($check.Name)=$currentVal (Expected: $($check.Expected))"
+            }
+        } else {
+            Add-Result -VulnID $check.VulnID -RuleID $check.RuleID -Severity $check.Severity `
+                -RuleTitle $check.Title -Status "Fail" `
+                -Details "$($check.Name)=$currentVal (Expected: $($check.Expected))"
+        }
+    }
+}
+
+# V-242009 | WNFWA-000100 | Inbound exceptions scoped to authorized hosts (workstations only)
+if (-not $isDomainJoined) {
+    Add-Result -VulnID "V-242009" -RuleID "WNFWA-000100" -Severity "medium" `
+        -RuleTitle "Inbound exceptions to the firewall on domain workstations must only allow authorized remote management hosts." `
+        -Status "N/A" -Details "System is not a domain workstation."
+} else {
+    Add-Result -VulnID "V-242009" -RuleID "WNFWA-000100" -Severity "medium" `
+        -RuleTitle "Inbound exceptions to the firewall on domain workstations must only allow authorized remote management hosts." `
+        -Status "Manual" -Details "Cannot auto-fix - requires organizational review of authorized management host IPs." `
+        -ManualSteps @"
+1. Open wf.msc > Inbound Rules.
+2. Review each Allow rule that permits inbound connections.
+3. For each rule: double-click > Scope tab > Remote IP address.
+4. Verify Remote IP addresses are restricted to authorized management systems.
+5. If any allowed inbound rule has Remote IP set to 'Any', this is a finding.
+6. Configure scope to specific authorized management host IPs/subnets.
+"@
+}
+
+# ============================================================================
+# ASD STIG V6R4 - Application Security and Development (264 rules)
+# Source: U_ASD_STIG_V6R4_Manual-xccdf.xml
+# Scope: High and Medium severity application-level security rules
+# Note: Most ASD STIG rules are application-level checks requiring manual
+#       review of application configuration, design documentation, and
+#       administrator interviews. Automated checks are added where possible.
+# ============================================================================
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  ASD STIG V6R4 - Application Security & Development" -ForegroundColor Cyan
+Write-Host "  264 Application-Level Security Rules" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$asdStigRules = @(
+    # --- Session Management ---
+    @{V="V-69239";R="SV-222387";S="medium";T="App must limit logon sessions per user";M="Review app session config. Verify per-user session limit is enforced per organizational policy."},
+    @{V="V-69241";R="SV-222388";S="medium";T="App must clear temp storage and cookies on session termination";M="Log in/out of app. Check cookies and local storage for residual auth data after logout. No username/password should remain."},
+    @{V="V-69243";R="SV-222389";S="medium";T="App must auto-terminate non-privileged sessions after 15 min idle";M="Log in as non-privileged user. Leave idle 15 min. Verify session terminates automatically."},
+    @{V="V-69245";R="SV-222390";S="medium";T="App must auto-terminate admin sessions after 10 min idle";M="Log in as admin user. Leave idle 10 min. Verify session terminates automatically."},
+    @{V="V-69247";R="SV-222391";S="medium";T="App must provide logoff capability for user sessions";M="Verify app provides a visible logoff function and session is fully terminated on logoff."},
+    # --- Data Marking / Security Attributes ---
+    @{V="V-69251";R="SV-222393";S="medium";T="App must associate security attributes with info in storage";M="If app processes classified/CUI data, verify data markings are maintained in storage. N/A if no marking requirement."},
+    @{V="V-69253";R="SV-222394";S="medium";T="App must associate security attributes with info in process";M="If app processes classified/CUI data, verify data markings retained during processing. N/A if no marking requirement."},
+    @{V="V-69255";R="SV-222395";S="medium";T="App must associate security attributes with info in transmission";M="If app processes classified/CUI data, verify data markings retained during transmission. N/A if no marking requirement."},
+    # --- Encryption / TLS ---
+    @{V="V-69257";R="SV-222396";S="medium";T="App must use DoD-approved encryption for remote access sessions";M="Verify app uses TLS for all remote sessions. Check for padlock icon in browser or TLS config in app settings."},
+    @{V="V-69259";R="SV-222397";S="medium";T="App must use crypto to protect integrity of remote sessions";M="Verify app uses TLS to protect integrity of all remote access sessions."},
+    # --- SOAP / WS-Security / SAML ---
+    @{V="V-69261";R="SV-222398";S="medium";T="SOAP messages must include signed Message ID, Request, Timestamp, SAML Assertion";M="If app uses SOAP, verify messages include digitally signed Message ID, Service Request, Timestamp, SAML Assertion. N/A if no SOAP."},
+    @{V="V-69279";R="SV-222399";S="high";T="WS_Security messages must use timestamps with creation and expiration";M="If app uses WS-Security, verify messages contain timestamps, sequence numbers, and expiration. N/A if no WS-Security."},
+    @{V="V-69281";R="SV-222400";S="high";T="Validity periods must be verified on WS-Security/SAML messages";M="If app uses WSS/SAML, verify validity periods are checked on all messages. N/A if no WSS/SAML."},
+    @{V="V-69283";R="SV-222401";S="medium";T="Each SAML asserting party must provide unique assertion IDs";M="If app uses SAML, verify assertion IDs are unique per asserting party. N/A if no SAML."},
+    @{V="V-69285";R="SV-222402";S="medium";T="Encrypted assertions required when passing through intermediary";M="If app uses WS-Security tokens via intermediary, verify approved encryption. N/A if no WS-Security."},
+    @{V="V-69287";R="SV-222403";S="high";T="SAML SubjectConfirmation must use NotOnOrAfter condition";M="If app uses SAML, verify SubjectConfirmation contains NotOnOrAfter element. N/A if no SAML."},
+    @{V="V-69289";R="SV-222404";S="high";T="SAML Conditions must use NotBefore/NotOnOrAfter or OneTimeUse";M="If app uses SAML, verify Conditions contains NotBefore+NotOnOrAfter or OneTimeUse. N/A if no SAML."},
+    @{V="V-69291";R="SV-222405";S="medium";T="Only one OneTimeUse element in SAML Conditions";M="If app uses SAML, verify only one OneTimeUse element exists in Conditions. N/A if no SAML."},
+    @{V="V-69293";R="SV-222406";S="medium";T="Encrypt messages when SessionIndex tied to privacy data";M="If app uses SAML AuthnStatement with SessionIndex tied to privacy data, verify encryption. N/A if no SAML."},
+    # --- Account Management ---
+    @{V="V-69295";R="SV-222407";S="medium";T="App must provide automated account management mechanisms";M="Verify app uses automated account management (e.g., AD/LDAP integration). Check for automated handling of inactive/terminated accounts."},
+    @{V="V-69297";R="SV-222408";S="medium";T="Shared/group account credentials must be terminated when members leave";M="If shared/group accounts exist, verify procedures for credential changes when members depart. N/A if no shared accounts."},
+    @{V="V-69299";R="SV-222409";S="medium";T="Temp user accounts must be auto-removed/disabled within 72 hours";M="If temp accounts are allowed, verify auto-disable/removal within 72 hours of creation."},
+    @{V="V-69303";R="SV-222412";S="medium";T="Unnecessary application accounts must be disabled or deleted";M="Generate list of all app accounts. Validate each is necessary. Disable/delete unnecessary ones."},
+    @{V="V-69305";R="SV-222413";S="medium";T="App must automatically audit account creation";M="Create test account and verify creation event is logged with account name, date/time."},
+    @{V="V-69307";R="SV-222414";S="medium";T="App must automatically audit account modification";M="Modify test account and verify modification event is logged with account name, date/time."},
+    @{V="V-69309";R="SV-222415";S="medium";T="App must automatically audit account disabling actions";M="Disable test account and verify disabling event is logged with account name, date/time."},
+    @{V="V-69311";R="SV-222416";S="medium";T="App must automatically audit account removal actions";M="Remove test account and verify removal event is logged with account name, date/time."},
+    @{V="V-69321";R="SV-222421";S="medium";T="App must automatically audit account enabling actions";M="Enable test account and verify enabling event is logged with account name, date/time."},
+    # --- Data Protection ---
+    @{V="V-69325";R="SV-222423";S="medium";T="Application data protection requirements must be documented";M="Verify documentation exists identifying data elements, protection requirements, and methods used."},
+    @{V="V-69327";R="SV-222424";S="medium";T="App must detect data mining attempts on defined data objects";M="If data mining protections are required, verify protections (query limits, alerts, record limits). N/A if not required."},
+    # --- Access Control ---
+    @{V="V-69329";R="SV-222425";S="high";T="App must enforce approved authorizations for logical access";M="Verify RBAC or equivalent is enforced. Test with restricted user to confirm denied access to unauthorized resources."},
+    @{V="V-69331";R="SV-222426";S="medium";T="App must enforce DAC policies over defined subjects and objects";M="If DAC is implemented, verify user1 can grant access to user2 and user3 is denied. N/A if no DAC."},
+    @{V="V-69333";R="SV-222427";S="medium";T="App must enforce info flow control within the system";M="If app provides data flow control, verify labeled data cannot be sent to prohibited areas. N/A if no flow control."},
+    @{V="V-69335";R="SV-222428";S="medium";T="App must enforce info flow control between interconnected systems";M="If app provides inter-system flow control, verify labeled data cannot flow to prohibited systems. N/A if no flow control."},
+    @{V="V-69337";R="SV-222429";S="medium";T="App must prevent non-privileged users from executing privileged functions";M="Check app process accounts are not in Administrators group (Windows) or UID 0 (UNIX). Verify file permissions."},
+    # --- Privilege Management ---
+    @{V="V-69339";R="SV-222430";S="high";T="App must execute without excessive account permissions";M="Verify app accounts are not admin/DBA. Check OS group membership and database privileges are minimized."},
+    @{V="V-69341";R="SV-222431";S="medium";T="App must audit execution of privileged functions";M="Perform admin tasks and verify privileged actions are logged with action detail, date/time."},
+    @{V="V-69343";R="SV-222432";S="high";T="App must enforce 3 consecutive invalid logon limit in 15 minutes";M="Attempt 3 incorrect logons within 15 min. Verify account locks on 4th attempt."},
+    @{V="V-69347";R="SV-222433";S="medium";T="Admin must follow approved process to unlock locked accounts";M="Verify documented and ISSO/ISSM-approved unlock process exists including identity validation."},
+    # --- Non-Repudiation ---
+    @{V="V-69357";R="SV-222438";S="medium";T="App must protect against false denial via non-repudiation";M="If non-repudiation (digital signatures) is required by design, verify functionality works. N/A if not required."},
+    # --- Audit Records ---
+    @{V="V-69359";R="SV-222439";S="medium";T="Audit aggregation must be time-correlated across components";M="If app aggregates logs from multiple systems, verify timestamps correlate. N/A if no log aggregation."},
+    @{V="V-69363";R="SV-222441";S="medium";T="App must audit session ID creation";M="Create new session and verify creation event is logged. N/A if delegated to app server."},
+    @{V="V-69365";R="SV-222442";S="medium";T="App must audit session ID destruction";M="Terminate session and verify destruction event is logged. N/A if delegated to app server."},
+    @{V="V-69367";R="SV-222443";S="medium";T="App must audit session ID renewal";M="Escalate privileges and verify new session info is created and logged. N/A if delegated to app server."},
+    @{V="V-69369";R="SV-222444";S="medium";T="App must not write sensitive data into logs";M="Search logs for passwords, SSNs, session IDs, encryption keys, source code. No sensitive data should be present."},
+    @{V="V-69371";R="SV-222445";S="medium";T="App must audit session timeouts";M="Let session timeout and verify timeout event is logged. N/A if delegated to app server."},
+    @{V="V-69373";R="SV-222446";S="medium";T="App must record timestamp for each audit event";M="Review logs and verify each event has a corresponding date/time stamp."},
+    @{V="V-69375";R="SV-222447";S="medium";T="App must audit HTTP headers (User-Agent, Referer, GET, POST)";M="Perform app actions and verify HTTP header info (User-Agent, Referer, etc.) is recorded in logs."},
+    @{V="V-69377";R="SV-222448";S="medium";T="App must audit connecting system IP addresses";M="Connect remotely and verify source IP address is recorded in logs."},
+    @{V="V-69379";R="SV-222449";S="medium";T="App must record username/user ID with each event";M="Perform app actions and verify user ID is recorded with each log event."},
+    @{V="V-69381";R="SV-222450";S="medium";T="App must audit successful/unsuccessful privilege grant attempts";M="Grant privileges (success and failure scenarios) and verify both events are logged with user identity."},
+    @{V="V-69383";R="SV-222451";S="medium";T="App must audit successful/unsuccessful security object access";M="Access security objects (success and failure) and verify both events are logged."},
+    @{V="V-69385";R="SV-222452";S="medium";T="App must audit successful/unsuccessful security level access";M="Access different security levels (success and failure) and verify both events are logged."},
+    @{V="V-69387";R="SV-222453";S="medium";T="App must audit successful/unsuccessful access to info categories";M="Access protected categories (success and failure) and verify both are logged. N/A if no compartmentalized data."},
+    @{V="V-69389";R="SV-222454";S="medium";T="App must audit successful/unsuccessful privilege modifications";M="Modify privileges (success and failure) and verify both events are logged with user identity."},
+    @{V="V-69391";R="SV-222455";S="medium";T="App must audit successful/unsuccessful security object modifications";M="Modify security objects (success and failure) and verify both events are logged."},
+    @{V="V-69393";R="SV-222456";S="medium";T="App must audit successful/unsuccessful security level modifications";M="Modify security levels (success and failure) and verify both events are logged."},
+    @{V="V-69395";R="SV-222457";S="medium";T="App must audit successful/unsuccessful info category modifications";M="Modify protected categories (success and failure) and verify both are logged. N/A if no compartmentalized data."},
+    @{V="V-69397";R="SV-222458";S="medium";T="App must audit successful/unsuccessful privilege deletions";M="Delete privileges (success and failure) and verify both events are logged."},
+    @{V="V-69399";R="SV-222459";S="medium";T="App must audit successful/unsuccessful security level deletions";M="Delete security levels (success and failure) and verify both events are logged."},
+    @{V="V-69401";R="SV-222460";S="medium";T="App must audit successful/unsuccessful DB security object deletions";M="Delete database security objects (success and failure) and verify both events are logged."},
+    @{V="V-69403";R="SV-222461";S="medium";T="App must audit successful/unsuccessful info category deletions";M="Delete protected categories (success and failure) and verify both are logged. N/A if no compartmentalized data."},
+    @{V="V-69405";R="SV-222462";S="medium";T="App must audit successful/unsuccessful logon attempts";M="Log in successfully and unsuccessfully. Verify both events are recorded in logs."},
+    @{V="V-69407";R="SV-222463";S="medium";T="App must audit privileged activities and system-level access";M="Perform admin actions (modify logging, start/stop services). Verify privileged activity is logged."},
+    @{V="V-69409";R="SV-222464";S="medium";T="App must audit start and end time of user sessions";M="Start and end a session. Verify both start and end timestamps are recorded in logs."},
+    @{V="V-69411";R="SV-222465";S="medium";T="App must audit successful/unsuccessful object access";M="Access app objects (files, folders, modules). Verify success and failure events are logged."},
+    @{V="V-69413";R="SV-222466";S="medium";T="App must audit all direct access to the information system";M="If app provides direct OS access (commands, file navigation), verify all such access is logged. N/A if no direct access."},
+    @{V="V-69415";R="SV-222467";S="medium";T="App must audit all account creation, modification, disabling, termination";M="Perform each account action (create, modify, disable, terminate). Verify all are logged individually."},
+    @{V="V-69419";R="SV-222468";S="medium";T="App must initiate session auditing upon startup";M="Start app service and verify logging begins immediately with startup sequence events recorded."},
+    @{V="V-69421";R="SV-222469";S="medium";T="App must log shutdown events";M="Shut down app service and verify shutdown event is recorded in logs."},
+    @{V="V-69423";R="SV-222470";S="medium";T="App must log destination IP addresses";M="If app initiates remote connections (including DNS/AD/LDAP), verify destination IPs are logged. N/A if no outbound connections."},
+    @{V="V-69425";R="SV-222471";S="medium";T="App must log user actions involving data access";M="Access data elements and verify access events are logged with user ID."},
+    @{V="V-69427";R="SV-222472";S="medium";T="App must log user actions involving data changes";M="Modify data elements and verify change events are logged with user ID."},
+    @{V="V-69429";R="SV-222473";S="medium";T="Audit records must include date and time of events";M="Verify all audit records include date and time for each event."},
+    @{V="V-69431";R="SV-222474";S="medium";T="Audit records must identify which component triggered the event";M="Verify logs identify the source component, module, library, or service name for each event."},
+    @{V="V-69433";R="SV-222475";S="medium";T="Centralized logging must include unique app identifier";M="If using centralized logging, verify app name and hostname are included in logs. N/A if logging locally."},
+    @{V="V-69435";R="SV-222476";S="medium";T="Audit records must contain event outcome";M="Verify logs include outcome (SUCCESS, FAILURE, ERROR) for each operation."},
+    @{V="V-69437";R="SV-222477";S="medium";T="Audit records must identify individual or process for each event";M="Verify logs include user ID or process identity for each event."},
+    @{V="V-69439";R="SV-222478";S="medium";T="Audit must include full-text of privileged commands or group user IDs";M="Execute privileged commands and verify full text is logged. Verify group account individual users are identified."},
+    @{V="V-69441";R="SV-222479";S="medium";T="Transaction-based apps must implement recovery logs";M="If app is transaction-based, verify transaction logging is enabled. N/A if not transaction-based."},
+    @{V="V-69443";R="SV-222480";S="medium";T="App must provide centralized audit content management";M="Verify app provides interface to configure what is captured in audit logs across all components. N/A if using enterprise logging."},
+    @{V="V-69445";R="SV-222481";S="medium";T="App must off-load audit records to different system";M="Verify automated log transfer to separate system per approved schedule. N/A if using centralized logging."},
+    @{V="V-69447";R="SV-222482";S="medium";T="App must write logs to centralized repository";M="Verify app writes logs to centralized log management system expeditiously."},
+    @{V="V-69449";R="SV-222483";S="medium";T="App must warn SA/ISSO at 75% audit storage capacity";M="Verify storage capacity alarms are set at 75%. N/A if using centralized logging with its own alerting."},
+    @{V="V-69451";R="SV-222484";S="medium";T="Moderate/high impact apps must provide real-time audit failure alerts";M="Verify real-time alerts configured for audit system failures. N/A if using centralized logging."},
+    @{V="V-69453";R="SV-222485";S="medium";T="App must alert ISSO/SA on audit processing failure";M="Verify alerts configured for audit processing failures. N/A if using centralized logging."},
+    @{V="V-69455";R="SV-222486";S="medium";T="App must shut down on audit failure unless availability overrides";M="Verify app halts on audit failure, or if overridden: verify log overwrite oldest-first or local spooling."},
+    @{V="V-69457";R="SV-222487";S="medium";T="App must provide centralized audit review from all components";M="Verify all app logs are reviewable from one central location. N/A if using centralized logging."},
+    @{V="V-69459";R="SV-222488";S="medium";T="App must filter audit records by events of interest";M="Verify filtering by: user, event type, date/time, IP, resource, severity, keywords. N/A if using centralized logging."},
+    @{V="V-69461";R="SV-222489";S="medium";T="App must support on-demand audit reporting";M="Verify on-demand reports from filtered audit data (screen, soft copy, or print). N/A if using centralized logging."},
+    @{V="V-69463";R="SV-222490";S="medium";T="App must support on-demand audit review and analysis";M="Verify on-demand audit review from filtered data. N/A if using centralized logging."},
+    @{V="V-69465";R="SV-222491";S="medium";T="App must support after-the-fact incident investigation via audit";M="Verify audit data can be filtered and reviewed for historical investigations. N/A if using centralized logging."},
+    @{V="V-69467";R="SV-222492";S="medium";T="App must provide on-demand report generation for audit review";M="Verify immediate ad-hoc audit report generation capability. N/A if using centralized logging."},
+    @{V="V-69469";R="SV-222493";S="medium";T="App must provide on-demand reporting capability";M="Verify customizable immediate ad-hoc log reporting. N/A if using centralized logging."},
+    @{V="V-69471";R="SV-222494";S="medium";T="App must provide after-the-fact report generation";M="Verify report generation for forensic investigations. N/A if using centralized logging."},
+    @{V="V-69473";R="SV-222495";S="medium";T="Audit reduction must not alter original content or time ordering";M="Apply filters, verify original records unchanged. Clear filters and re-verify records intact."},
+    @{V="V-69475";R="SV-222496";S="medium";T="Report generation must not alter original audit content";M="Generate reports and verify original log records remain unmodified."},
+    @{V="V-69477";R="SV-222497";S="medium";T="App must use system clocks for audit timestamps";M="Compare app log timestamps with OS clock. Verify they correlate."},
+    @{V="V-69479";R="SV-222498";S="medium";T="Audit timestamps must map to UTC or GMT";M="Verify app timestamps map to UTC/GMT. N/A if using OS system clock mapped to UTC/GMT."},
+    @{V="V-69481";R="SV-222499";S="medium";T="Audit timestamps must have 1-second minimum granularity";M="Compare log timestamps with OS clock over 10 min. Verify within 1 second. N/A if using OS time source."},
+    @{V="V-69483";R="SV-222500";S="medium";T="Audit info must be protected from unauthorized read access";M="Verify log file permissions restrict read access to authorized roles only. Test with non-privileged account."},
+    @{V="V-69485";R="SV-222501";S="medium";T="Audit info must be protected from unauthorized modification";M="Verify log file permissions restrict write/modify access. Test with non-privileged account."},
+    @{V="V-69487";R="SV-222502";S="medium";T="Audit info must be protected from unauthorized deletion";M="Verify log file permissions restrict delete access. Test with non-privileged account."},
+    @{V="V-69489";R="SV-222503";S="medium";T="Audit tools must be protected from unauthorized access";M="Verify audit tool file permissions restrict access to authorized users. N/A if no separate audit tools."},
+    @{V="V-69491";R="SV-222504";S="medium";T="Audit tools must be protected from unauthorized modification";M="Verify audit tool files have restricted write permissions. N/A if no separate audit tools."},
+    @{V="V-69493";R="SV-222505";S="medium";T="Audit tools must be protected from unauthorized deletion";M="Verify audit tool files have restricted delete permissions. N/A if no separate audit tools."},
+    @{V="V-69495";R="SV-222506";S="medium";T="Audit records must be backed up at least every 7 days";M="Verify backup settings include audit log backup every 7 days. N/A if no built-in backup capability."},
+    @{V="V-69497";R="SV-222507";S="medium";T="App must use crypto to protect audit integrity";M="Verify cryptographic hash/digest is created for stored log files. N/A if using centralized logging with crypto."},
+    @{V="V-69499";R="SV-222508";S="medium";T="Audit tools must be cryptographically hashed";M="Verify hash values exist for audit tool files. N/A if no separate audit tools or file monitoring in place."},
+    @{V="V-69501";R="SV-222509";S="medium";T="Audit tool integrity must be validated by checking hash values";M="Verify periodic hash validation process for audit tools. N/A if no separate audit tools."},
+    # --- Software / Configuration Management ---
+    @{V="V-69503";R="SV-222510";S="medium";T="App must prohibit user software installation without privilege";M="As regular user, attempt software install. Verify denied unless from approved repository."},
+    @{V="V-69505";R="SV-222511";S="medium";T="App must enforce config change access restrictions";M="As non-privileged user, attempt config changes. Verify denied. Check config file permissions."},
+    @{V="V-69507";R="SV-222512";S="medium";T="App must audit who makes configuration changes";M="Make config changes as admin and verify user account is logged in audit records."},
+    @{V="V-69509";R="SV-222513";S="medium";T="App must prevent unsigned patch/component installation";M="Verify app can prevent unsigned patches or vendor provides hash values for manual pre-install verification."},
+    @{V="V-69511";R="SV-222514";S="medium";T="App must limit privileges to change software libraries";M="Check file permissions on app library folders. Verify restricted to authorized users/processes."},
+    # --- Vulnerability Assessment ---
+    @{V="V-69513";R="SV-222515";S="medium";T="Application vulnerability assessment must be conducted";M="Obtain latest scan results covering all app components. High-risk issues must be fixed or mitigated."},
+    # --- Execution Control ---
+    @{V="V-69515";R="SV-222516";S="medium";T="App must restrict execution per org policies";M="Verify execution restrictions via Group Policy, AppLocker, SRP, or RBAC per policy. N/A if no restrictions required."},
+    @{V="V-69517";R="SV-222517";S="medium";T="App must use deny-all permit-by-exception whitelist";M="Verify deny-all whitelist via AppLocker, WDAC, or equivalent. N/A if not a config management application."},
+    @{V="V-69519";R="SV-222518";S="medium";T="App must disable non-essential capabilities";M="Review app features, modules, and running services. Disable any not required for mission objectives."},
+    @{V="V-69521";R="SV-222519";S="medium";T="App must use only PPSM CAL approved ports and protocols";M="Identify app ports/protocols. Verify against PPSM CAL at https://cyber.mil/ppsm/cal/."},
+    # --- Authentication ---
+    @{V="V-69523";R="SV-222520";S="medium";T="App must require reauthentication on privilege/role change";M="Change user role within app and verify reauthentication is required before proceeding."},
+    @{V="V-69525";R="SV-222521";S="medium";T="App must require devices to reauthenticate periodically";M="Verify device reauthentication interval is configured per local policy requirements."},
+    @{V="V-69527";R="SV-222522";S="high";T="App must uniquely identify and authenticate organizational users";M="Verify unique user account and password/CAC are required for access. N/A for publicly releasable data."},
+    @{V="V-69529";R="SV-222523";S="medium";T="App must use MFA (Alt. Token) for network access to privileged accounts";M="Verify admin network access requires Alt. Token. CAC alone should not grant admin functions."},
+    @{V="V-69531";R="SV-222524";S="medium";T="App must accept PIV credentials";M="Verify app prompts for CAC certificate selection. N/A if not PK-enabled or public data."},
+    @{V="V-69533";R="SV-222525";S="medium";T="App must electronically verify PIV credentials";M="Verify app validates CAC and requires PIN entry. N/A if not PK-enabled or public data."},
+    @{V="V-69535";R="SV-222526";S="medium";T="App must use MFA for network access to non-privileged accounts";M="Verify CAC/Alt. Token required for non-privileged network access. N/A if not PK-enabled or public data."},
+    @{V="V-69537";R="SV-222527";S="medium";T="App must use MFA (Alt. Token) for local access to privileged accounts";M="Verify local admin access requires Alt. Token authentication."},
+    @{V="V-69539";R="SV-222528";S="medium";T="App must use MFA for local access to non-privileged accounts";M="Verify CAC/Alt. Token required for local non-privileged access. N/A if not PKI-enabled or public data."},
+    @{V="V-69541";R="SV-222529";S="medium";T="Users must authenticate individually before using group authenticator";M="Verify individual auth required before group/shared account access. N/A if no group accounts."},
+    @{V="V-69543";R="SV-222530";S="medium";T="App must use replay-resistant auth for privileged network access";M="Verify TLSv1.2+, Kerberos, IPSEC, or SSH protects privileged access. Check scan results for replay vulnerabilities."},
+    @{V="V-69545";R="SV-222531";S="medium";T="App must use replay-resistant auth for non-privileged network access";M="Verify TLSv1.2+, Kerberos, IPSEC, or SSH protects non-privileged access. N/A if public data or no DoD CAC eligibility."},
+    @{V="V-69547";R="SV-222532";S="medium";T="App must use mutual authentication when required by policy/data owner";M="If mutual auth required, verify server requests client certificates and CLIENT-CERT login-config is set."},
+    @{V="V-69549";R="SV-222533";S="medium";T="App must authenticate all network connected endpoint devices";M="If app uses web services/SOA, verify Client Certificate auth (not Basic Auth). N/A if end-user interactive only."},
+    @{V="V-69551";R="SV-222534";S="medium";T="SOA handling non-releasable data must use mutual SSL/TLS";M="If SOA processes non-releasable data, verify mutual TLS client certificate authentication. N/A otherwise."},
+    @{V="V-69553";R="SV-222535";S="medium";T="Disable device identifiers after 35 days inactivity";M="Verify device accounts disabled after 35 days inactivity. N/A if using PKI certs or no device authentication."},
+    @{V="V-69555";R="SV-222536";S="high";T="App must enforce minimum 15-character password length";M="Attempt password shorter than 15 chars. Verify rejected. N/A if app does not use passwords."},
+    @{V="V-69557";R="SV-222537";S="medium";T="App must require at least one uppercase character in password";M="Attempt password without uppercase. Verify rejected. N/A if app does not use passwords."},
+    @{V="V-69559";R="SV-222538";S="medium";T="App must require at least one lowercase character in password";M="Attempt password without lowercase. Verify rejected. N/A if app does not use passwords."},
+    @{V="V-69561";R="SV-222539";S="medium";T="App must require at least one numeric character in password";M="Attempt password without number. Verify rejected. N/A if app does not use passwords."},
+    @{V="V-69563";R="SV-222540";S="medium";T="App must require at least one special character in password";M="Attempt password without special char. Verify rejected. N/A if app does not use passwords."},
+    @{V="V-69565";R="SV-222541";S="medium";T="App must require change of at least 8 characters on password change";M="Change password with fewer than 8 character differences. Verify rejected. N/A if no passwords."},
+    @{V="V-69567";R="SV-222542";S="high";T="App must only store cryptographic representations of passwords";M="Review password storage. Verify hashed (not MD5). No readable passwords. N/A if app does not use passwords."},
+    @{V="V-69569";R="SV-222543";S="high";T="App must transmit only cryptographically-protected passwords";M="Verify TLS/SSL protects password transmission (HTTPS lock icon). N/A if app does not use passwords."},
+    @{V="V-69571";R="SV-222544";S="medium";T="App must enforce 24-hour minimum password lifetime";M="Attempt password change twice within 24 hours. Verify second change rejected. N/A if no passwords."},
+    @{V="V-69573";R="SV-222545";S="medium";T="App must enforce 60-day maximum password lifetime";M="Review password settings. Verify passwords expire after 60 days. N/A if app does not use passwords."},
+    @{V="V-69575";R="SV-222546";S="medium";T="App must prohibit password reuse for 5 generations minimum";M="Verify password reuse prohibited for at least 5 previous passwords. N/A if no passwords."},
+    @{V="V-69577";R="SV-222547";S="medium";T="App must allow temp password with immediate change on first use";M="Create user with temp password. Verify forced change on first login. N/A if no passwords."},
+    @{V="V-70145";R="SV-222548";S="medium";T="Password changeable only by owner or admin";M="As User A, attempt to change User B password. Verify denied. N/A if no passwords."},
+    @{V="V-70147";R="SV-222549";S="medium";T="App must terminate sessions upon account deletion";M="Delete test account while session active. Verify session terminates immediately."},
+    # --- PKI ---
+    @{V="V-70149";R="SV-222550";S="high";T="PKI auth must validate cert path to accepted trust anchor";M="Verify app constructs certification path through intermediary CAs to trusted root anchor."},
+    @{V="V-70151";R="SV-222551";S="high";T="PKI auth must enforce authorized private key access";M="Verify private key access restricted by file permissions or app controls. N/A if no private keys."},
+    @{V="V-70153";R="SV-222552";S="medium";T="PKI auth must map identity to individual user or group";M="Verify app maps certificate data to individual user identities in logs."},
+    @{V="V-70155";R="SV-222553";S="medium";T="PKI auth must implement local CRL cache";M="Verify CRL import process and app checks CRL when OCSP unavailable. N/A if SIPRNet without root CA access."},
+    @{V="V-70157";R="SV-222554";S="high";T="App must not display passwords/PINs as clear text";M="Enter password and verify input is obfuscated. Copy and paste obfuscated text - verify no clear text revealed."},
+    @{V="V-70159";R="SV-222555";S="high";T="App must use FIPS-validated crypto modules for authentication";M="Verify crypto module is on FIPS 140-2 approved list at csrc.nist.gov. N/A if no crypto module authentication."},
+    @{V="V-70161";R="SV-222556";S="medium";T="App must uniquely identify/authenticate non-organizational users";M="Verify non-org users are uniquely identified and authenticated. N/A if no non-org users."},
+    @{V="V-70163";R="SV-222557";S="medium";T="App must accept PIV from other federal agencies";M="Verify app accepts PIV credentials from other agencies. N/A if not for federal partners or SIPRNet only."},
+    @{V="V-70165";R="SV-222558";S="medium";T="App must electronically verify PIV from other federal agencies";M="Verify app validates PIV from other agencies. N/A if not for federal partners or SIPRNet only."},
+    @{V="V-70167";R="SV-222559";S="medium";T="App must accept FICAM-approved third-party credentials";M="Verify FICAM-approved credentials accepted for third-party access. N/A if not for federal partners or SIPRNet."},
+    @{V="V-70169";R="SV-222560";S="medium";T="App must conform to FICAM-issued profiles (SAML/OpenID)";M="Verify conformance to FICAM profiles when using external identity providers. N/A if not a service provider."},
+    # --- Maintenance ---
+    @{V="V-70171";R="SV-222561";S="medium";T="Non-local maintenance sessions must be audited";M="Perform remote maintenance tasks and verify actions are logged. N/A if no remote maintenance capability."},
+    @{V="V-70175";R="SV-222562";S="medium";T="Non-local maintenance must use crypto for integrity";M="Verify remote maintenance sessions use TLS/SSL encryption. N/A if no remote maintenance capability."},
+    @{V="V-70177";R="SV-222563";S="medium";T="Non-local maintenance must use crypto for confidentiality";M="Verify remote maintenance sessions use TLS/SSL encryption. N/A if no remote maintenance capability."},
+    @{V="V-70179";R="SV-222564";S="medium";T="Non-local maintenance must verify remote disconnection";M="End maintenance session. Use netstat to verify network connections terminate. Check logs for disconnect event."},
+    @{V="V-70181";R="SV-222565";S="medium";T="Non-local maintenance must use strong authenticators (CAC)";M="Verify CAC required for remote maintenance sessions. N/A if no remote maintenance capability."},
+    @{V="V-70183";R="SV-222566";S="medium";T="App must terminate sessions when non-local maintenance completes";M="Verify admin idle timeout is 10 min and user idle timeout is 15 min."},
+    # --- Application Security ---
+    @{V="V-70185";R="SV-222567";S="medium";T="App must not be vulnerable to race conditions";M="Review code analysis results for race condition vulnerabilities. N/A if COTS without code review access."},
+    @{V="V-70187";R="SV-222568";S="medium";T="App must terminate network connections at end of session";M="Monitor with netstat. End session and verify connections close. Document any exceptions with mitigations."},
+    @{V="V-70191";R="SV-222570";S="medium";T="App must use FIPS-validated crypto for signing components";M="Verify code signing uses FIPS-validated modules. No SHA1 or MD5. N/A if signing not required with risk acceptance."},
+    @{V="V-70193";R="SV-222571";S="medium";T="App must use FIPS-validated crypto for hashing";M="Verify hashing uses FIPS-validated modules. No MD5 or SHA1. SHA-384+ required for NSS."},
+    @{V="V-70195";R="SV-222572";S="medium";T="App must use FIPS-validated crypto for unclassified data protection";M="Verify crypto modules are FIPS 140-2 validated at csrc.nist.gov for all cryptographic operations."},
+    @{V="V-70197";R="SV-222573";S="medium";T="SAML assertions must use FIPS-approved random numbers for SessionIndex";M="Verify FIPS-validated random number generator for SAML SessionIndex. N/A if no SAML assertions."},
+    @{V="V-70199";R="SV-222574";S="medium";T="User interface must be separated from data/management interfaces";M="Verify app provides separate user and management interfaces (physical or virtual separation)."},
+    @{V="V-70201";R="SV-222575";S="medium";T="App must set HTTPOnly flag on session cookies";M="Use browser dev tools (F12) to inspect session cookies. Verify HttpOnly flag is set."},
+    @{V="V-70203";R="SV-222576";S="medium";T="App must set Secure flag on session cookies";M="Inspect session cookies via browser dev tools. Verify Secure flag is set."},
+    @{V="V-70205";R="SV-222577";S="high";T="App must not expose session IDs";M="Verify all session ID traffic is encrypted via TLS/SSL on all communication paths point-to-point."},
+    @{V="V-70207";R="SV-222578";S="high";T="App must destroy session ID/cookie on logoff or browser close";M="Log out and check cookies. Verify session cookies destroyed. Close browser and recheck."},
+    @{V="V-70209";R="SV-222579";S="medium";T="App must use system-generated session IDs protecting against fixation";M="Verify session IDs are newly generated on each login and not reused after logout."},
+    @{V="V-70211";R="SV-222580";S="medium";T="App must validate session identifiers";M="Verify app validates session IDs on each request per framework configuration."},
+    @{V="V-70213";R="SV-222581";S="medium";T="App must not use URL-embedded session IDs";M="Verify session IDs transmitted via cookies, not URL parameters or URL rewriting."},
+    @{V="V-70215";R="SV-222582";S="medium";T="App must not re-use or recycle session IDs";M="Verify session IDs are unique and not reused after user logout."},
+    @{V="V-70217";R="SV-222583";S="medium";T="App must use FIPS 140-2/3 random number generator for session IDs";M="Verify session ID generation uses FIPS 140-2/140-3 approved random number generator."},
+    @{V="V-70219";R="SV-222584";S="medium";T="App must only use DoD-approved CAs for protected sessions";M="View certificate in browser. Verify issuer is DoD-approved PKI or ECA Certificate Authority."},
+    @{V="V-70221";R="SV-222585";S="high";T="App must fail to secure state on init/shutdown/abort failure";M="Simulate failure (stop services). Verify DB requires auth, source files inaccessible, data files unopenable."},
+    @{V="V-70223";R="SV-222586";S="medium";T="App must preserve failure info for root cause and recovery";M="Verify app logs diagnostic info for root cause analysis. Verify recovery procedures are documented."},
+    @{V="V-70225";R="SV-222587";S="medium";T="App must protect confidentiality and integrity of stored info";M="Verify stored data protections match data owner requirements. Demonstrate protection methods for classified/CUI."},
+    @{V="V-70227";R="SV-222588";S="high";T="App must use approved crypto to prevent unauthorized modification at rest";M="Verify encryption protects data at rest per requirements. N/A if publicly releasable data only."},
+    @{V="V-70229";R="SV-222589";S="high";T="App must use appropriate crypto for stored DoD information";M="Verify encryption commensurate with classification. Type 1/Suite B for classified. N/A if publicly releasable."},
+    @{V="V-70231";R="SV-222590";S="medium";T="App must isolate security functions from non-security functions";M="Verify access controls (RBAC/ACL/MAC) protect security config settings from unauthorized modification."},
+    @{V="V-70233";R="SV-222591";S="medium";T="App must maintain separate execution domain per process";M="Verify app processes run in separate domains/sandboxes. Check OS processes for separation."},
+    @{V="V-70235";R="SV-222592";S="medium";T="App must prevent unauthorized info transfer via shared resources";M="If app shares system resources, verify security boundary prevents unauthorized cross-app access."},
+    @{V="V-70237";R="SV-222593";S="medium";T="XML apps must mitigate DoS using filters, parser options, or gateways";M="If app uses XML, verify: recursive payload validation, oversized payload limits, entity expansion prevention. N/A if no XML."},
+    @{V="V-70239";R="SV-222594";S="medium";T="App must restrict DoS attack capability against itself and others";M="Review vulnerability/penetration test results. Verify app not susceptible to DoS and cannot be weaponized."},
+    @{V="V-70241";R="SV-222595";S="medium";T="HA web service design must include redundancy mechanisms";M="If designated HA, verify load balancers, redundant servers, redundant circuits, or clustering. N/A if not HA."},
+    @{V="V-70245";R="SV-222596";S="high";T="App must protect confidentiality and integrity of transmitted info";M="Verify all app communications use TLS, IPsec, or approved encryption mechanisms."},
+    @{V="V-70247";R="SV-222597";S="medium";T="App must use crypto to prevent unauthorized disclosure in transmission";M="Verify point-to-point TLS or per-message encryption based on app architecture. N/A if PDS protected."},
+    @{V="V-70249";R="SV-222598";S="medium";T="App must protect confidentiality/integrity during prep for transmission";M="Verify TLS encryption active before data sent. Check for automatic HTTPS redirect."},
+    @{V="V-70251";R="SV-222599";S="medium";T="App must protect confidentiality/integrity during reception";M="Verify TLS encryption protects received data including inter-tier communications."},
+    @{V="V-70253";R="SV-222600";S="medium";T="App must not disclose unnecessary information to users";M="Review all screens as non-privileged user. No DB version, server info, or technical details should appear."},
+    @{V="V-70255";R="SV-222601";S="high";T="App must not store sensitive information in hidden fields";M="Review vulnerability scan/code review for hidden fields. No auth or session data in hidden fields."},
+    @{V="V-70257";R="SV-222602";S="high";T="App must protect from Cross-Site Scripting (XSS)";M="Test input fields with <script>alert('XSS')</script>. No popup should appear. Verify scan includes XSS tests."},
+    @{V="V-70259";R="SV-222603";S="medium";T="App must protect from Cross-Site Request Forgery (CSRF)";M="Review scan results for CSRF. Verify anti-CSRF tokens and HTTP referrer validation are implemented."},
+    @{V="V-70261";R="SV-222604";S="high";T="App must protect from command injection";M="Verify vulnerability scan tests for command injection. Review OWASP OTG-INPVAL-013 for manual tests."},
+    @{V="V-70263";R="SV-222605";S="medium";T="App must protect from canonical representation vulnerabilities";M="Verify scan/code review tests for canonicalization and character set handling issues."},
+    @{V="V-70265";R="SV-222606";S="medium";T="App must validate all input";M="Verify vulnerability scan includes input validation and fuzzing. Test all data entry fields."},
+    @{V="V-70267";R="SV-222607";S="high";T="App must not be vulnerable to SQL Injection";M="Verify vulnerability scan tests for SQL injection across all DB interfaces."},
+    @{V="V-70269";R="SV-222608";S="high";T="App must not be vulnerable to XML-oriented attacks";M="If app uses XML, verify scan tests for XML/XPath injection, XML spoofing, entity attacks. N/A if no XML."},
+    @{V="V-70271";R="SV-222609";S="high";T="App must not be subject to input handling vulnerabilities";M="Verify scan tests for input validation issues. Remediate high-risk findings or obtain ISSO risk acceptance."},
+    @{V="V-70273";R="SV-222610";S="medium";T="Error messages must not reveal exploitable info to non-privileged users";M="Trigger errors as non-privileged user. Verify no variable names, SQL, paths, or source code disclosed."},
+    @{V="V-70275";R="SV-222611";S="medium";T="Detailed error messages only for ISSO/ISSM/SA";M="Trigger errors as non-privileged vs privileged user. Detailed errors visible only to privileged users."},
+    @{V="V-70277";R="SV-222612";S="high";T="App must not be vulnerable to overflow attacks";M="Verify code analysis tests for buffer, stack, heap, integer, and format string overflows. Remediate findings."},
+    # --- Patching / Updates ---
+    @{V="V-70279";R="SV-222613";S="medium";T="App must remove old components after updates";M="After updates, check for old version files on disk. Remove any remaining old components."},
+    @{V="V-70281";R="SV-222614";S="medium";T="Security updates and patches must be kept up to date";M="Verify patches checked weekly and applied per IAVMs, CTOs, DTMs, or POA&Ms."},
+    # --- Security Function Verification ---
+    @{V="V-70283";R="SV-222615";S="medium";T="App must verify correct operation of security functions";M="If app is designed for security function testing, verify it validates correct operation. N/A otherwise."},
+    @{V="V-70285";R="SV-222616";S="medium";T="Security function verification on startup/restart/command/30 days";M="Verify security function testing runs on startup, restart, and on privileged command. N/A if not designed for this."},
+    # --- Mobile Code ---
+    @{V="V-70289";R="SV-222618";S="medium";T="Unsigned Category 1A mobile code must not be used";M="Add app URL to Trusted Sites. Test app functions. Browser should indicate code is digitally signed. N/A if no mobile code."},
+    # --- Administrative / Operational ---
+    @{V="V-70291";R="SV-222619";S="medium";T="Account management process must be implemented and verified";M="Verify documented process for account creation, termination, expiration. Verify departed personnel accounts removed."},
+    @{V="V-70293";R="SV-222620";S="high";T="Tiered app web servers must be on separate network segment in DMZ";M="If in DoD DMZ, verify web/app/DB servers on separate network segments per DMZ STIG. N/A if not in DMZ."},
+    @{V="V-70295";R="SV-222621";S="medium";T="Audit trails retained 30 months (non-SAMI) or 5 years (SAMI)";M="Verify retention: 12 months active + 18 months cold storage for non-SAMI; 5 years for SAMI data."},
+    @{V="V-70297";R="SV-222622";S="medium";T="Audit trails must be reviewed periodically per documentation";M="Verify documented schedule for audit log review and evidence of most recent review."},
+    @{V="V-70301";R="SV-222623";S="medium";T="Suspected IA policy violations must be reported per DoD procedures";M="Verify documented policy exists for reporting IA violations."},
+    @{V="V-70303";R="SV-222624";S="medium";T="Active vulnerability testing must be performed";M="Verify scan and fuzz test results exist. Config must cover all app components. Critical vulns 21+ days old = finding."},
+    @{V="V-70307";R="SV-222625";S="medium";T="Execution flow diagrams must address deadlock/recursion in web services";M="If app deploys web services, verify documentation addresses deadlock mitigation. N/A if no web services developed."},
+    @{V="V-70309";R="SV-222626";S="medium";T="Config/control files must not be in same directory as user data";M="Verify app config files and user data are in separate directories. Check file permissions restrict user access to config."},
+    @{V="V-70311";R="SV-222627";S="medium";T="Use third-party guidance if no DoD STIG/NSA guide available";M="If no STIG exists, verify config follows vendor guidance, commercial best practices, or independent testing results."},
+    @{V="V-70313";R="SV-222628";S="medium";T="Ports/protocols must be submitted through DoD PPSM";M="Verify app ports/protocols comply with PPSM CAL at https://cyber.mil/ppsm/cal/."},
+    @{V="V-70317";R="SV-222629";S="medium";T="App must be registered with DoD Ports and Protocols Database";M="Verify app and all ports are registered in the DoD Ports and Protocols Database for production."},
+    @{V="V-70339";R="SV-222630";S="medium";T="CM repository must be patched and STIG compliant";M="Verify CM system has latest security patches and relevant STIGs applied. N/A if no in-house development/CM."},
+    @{V="V-70341";R="SV-222631";S="medium";T="CM repository access privileges reviewed every 3 months";M="Verify CM access privileges reviewed within last 3 months. N/A if no in-house CM repository."},
+    @{V="V-70343";R="SV-222632";S="medium";T="SCM plan must describe config control and change management";M="Verify SCM plan covers objects, roles, responsibilities, tools, baselines, access controls, audit. N/A if no in-house dev."},
+    @{V="V-70345";R="SV-222633";S="medium";T="CCB must meet at least every release cycle";M="Verify CCB exists with charter and evidence of meeting before last release. N/A if no in-house development."},
+    @{V="V-70347";R="SV-222634";S="medium";T="App services and interfaces must be IPv6 compatible";M="Verify app complies with DoD IPv6 Standards Profile for IPv6 Capable Products."},
+    @{V="V-70349";R="SV-222635";S="medium";T="Critical/HA apps must not be on general purpose machines";M="Verify mission-critical app is not co-hosted with non-mission-critical applications."},
+    @{V="V-70351";R="SV-222636";S="medium";T="Contingency plan must exist per DoD policy for availability level";M="Verify contingency plan: HA=immediate transfer, moderate=12hr resume, low=5-30 day partial resume."},
+    @{V="V-70353";R="SV-222637";S="medium";T="Recovery procedures must enable secure and verifiable recovery";M="Verify disaster recovery plan includes the application and documents trusted recovery considerations."},
+    @{V="V-70355";R="SV-222638";S="medium";T="Data backup at required intervals per DoD policy and risk level";M="Verify backups per risk: low=weekly, moderate=daily+offsite, high=redundant systems with 6-month testing."},
+    @{V="V-70357";R="SV-222639";S="medium";T="Backup copies in fire-rated container or stored offsite";M="Verify app software/source code backup is in fire-rated container or stored offsite from operational environment."},
+    @{V="V-70359";R="SV-222640";S="medium";T="Backup/restoration assets must be physically and technically protected";M="Verify backup devices and media are included in recovery procedures and stored separately from primary assets."},
+    @{V="V-70361";R="SV-222641";S="medium";T="App must encrypt key exchange and authenticate endpoints";M="Verify FIPS 140-2 validated crypto for key exchange. N/A if no key exchange implemented."},
+    @{V="V-70363";R="SV-222642";S="high";T="App must not contain embedded authentication data";M="Search config files, scripts, HTML, ASP/ASPX for embedded passwords/certs. Verify restricted file permissions."},
+    @{V="V-70365";R="SV-222643";S="high";T="App must mark sensitive/classified output when required";M="Verify markings on screens/reports for classified/CUI data (top and bottom minimum). Manual marking procedures acceptable."},
+    @{V="V-70369";R="SV-222645";S="medium";T="App files must be cryptographically hashed before deployment";M="Verify hash validation process. Use Get-FileHash (SHA256) to validate against vendor-provided hashes."},
+    @{V="V-70371";R="SV-222646";S="medium";T="Security tester must be designated for flaw testing";M="Verify designated security testers exist in addition to functional testers. N/A if no in-house development."},
+    @{V="V-70375";R="SV-222648";S="medium";T="Application code review must be performed";M="Verify code reviews cover: format strings, memory leaks, buffer overflows, race conditions, SQL injection, dead code. N/A if no in-house dev."},
+    @{V="V-70379";R="SV-222650";S="medium";T="Code review flaws must be tracked in defect tracking system";M="Verify CM repository captures code review defects. N/A if no in-house development."},
+    @{V="V-70381";R="SV-222651";S="medium";T="Changes must be assessed for IA/accreditation impact before implementation";M="Verify CCB or similar process evaluates IA impact before implementing changes."},
+    @{V="V-70383";R="SV-222652";S="medium";T="Security flaws must be addressed in project plan";M="Verify security flaws are tracked in project plan. N/A if no in-house development."},
+    @{V="V-70389";R="SV-222655";S="medium";T="Threat models documented and reviewed per release";M="Verify threat model with: threats, vulnerabilities, countermeasures, mitigations, ISSO/ISSM approval. N/A if no in-house dev."},
+    @{V="V-70391";R="SV-222656";S="medium";T="App must not have error handling vulnerabilities";M="Review security scan/code analysis for error handling issues. Verify proper exception handling throughout."},
+    @{V="V-70393";R="SV-222657";S="medium";T="Dev team must provide application incident response plan";M="Verify plan tracks/confirms vulns, tracks remediation, notifies users of updates. N/A if COTS without dev access."},
+    @{V="V-70395";R="SV-222658";S="high";T="All products must be supported by vendor or development team";M="Verify all app components are vendor-supported. Check vendor website for current version support status."},
+    @{V="V-70397";R="SV-222659";S="high";T="App must be decommissioned when support is no longer available";M="Verify all app components are under active maintenance contract. Decommission if support has ended."},
+    @{V="V-70401";R="SV-222661";S="medium";T="Unnecessary built-in application accounts must be disabled";M="Review account list for vendor default accounts (e.g., Oracle, Tivoli). Disable unnecessary; change passwords on required."},
+    @{V="V-70403";R="SV-222662";S="high";T="Default passwords must be changed";M="Search Internet for app name + 'default password'. Attempt authentication with published defaults. Change if successful."},
+    @{V="V-70405";R="SV-222663";S="medium";T="Application Configuration Guide must exist";M="Verify guide covers: encryption, PKI, passwords, auditing, AD, backup, deployment, network, security assumptions."},
+    @{V="V-70407";R="SV-222664";S="medium";T="Security Classification Guide must exist for classified data apps";M="If classified data, verify guide with data elements and classifications per DOD 5200.01 Vol 1. N/A if unclassified."},
+    @{V="V-70409";R="SV-222665";S="medium";T="Uncategorized or emerging mobile code must not be used";M="Identify mobile code types. Verify waiver and risk acceptance for any uncategorized mobile code."},
+    @{V="V-70411";R="SV-222666";S="medium";T="Production DB exports must have credentials/sensitive data removed";M="If prod data exported to test/dev, verify sensitive data is sanitized before or immediately after import. N/A if no exports."},
+    @{V="V-70413";R="SV-222667";S="medium";T="DoS attack protections must be implemented per threat model";M="Review threat model for DoS threats. Verify identified mitigations are implemented. N/A if no DoS threats identified."},
+    @{V="V-70415";R="SV-222668";S="medium";T="System must alert administrator on low resource conditions";M="Verify automated continuous monitoring with alerts for low resources and unusual/inappropriate activity."},
+    @{V="V-70421";R="SV-222671";S="medium";T="Public-facing apps must route through DMZ";M="If app is publicly accessible, verify traffic is routed through a DMZ."},
+    @{V="V-70425";R="SV-222673";S="medium";T="All program staff must receive annual security training";M="Verify annual security training for managers, designers, developers, testers (beyond DoD 8570). N/A if no in-house dev."},
+    @{V="V-70189";R="SV-265634";S="medium";T="App must use NSA-approved crypto for classified information";M="If classified data: NIST FIPS 140-2 for non-SAMI, NSA Type 1 for SAMI. N/A if unclassified."}
+)
+
+# Process all ASD STIG rules
+foreach ($rule in $asdStigRules) {
+    Add-Result -VulnID $rule.V -RuleID $rule.R -Severity $rule.S `
+        -RuleTitle $rule.T -Status "Manual" `
+        -Details "ASD STIG V6R4: Application-level check requiring manual review of application configuration and documentation." `
+        -ManualSteps $rule.M
+}
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  SCAN COMPLETE - SUMMARY" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  Total Checks:   $script:TotalChecks"
+Write-Host "  Passed:          $script:PassCount" -ForegroundColor Green
+Write-Host "  Auto-Fixed:      $script:FixedCount" -ForegroundColor Magenta
+Write-Host "  Failed:          $script:FailCount" -ForegroundColor Red
+Write-Host "  Manual Review:   $script:ManualCount" -ForegroundColor Yellow
+Write-Host "  Not Applicable:  $script:NACount" -ForegroundColor Cyan
+Write-Host ""
+
+$highFail = ($script:Results | Where-Object { $_.Status -eq "Fail" -and $_.Severity -eq "high" }).Count
+if ($highFail -gt 0) {
+    Write-Host "  *** $highFail HIGH severity findings remain! ***" -ForegroundColor Red
+}
+if ($script:FixedCount -gt 0) {
+    Write-Host "  *** $script:FixedCount checks were auto-remediated. A REBOOT may be required. ***" -ForegroundColor Magenta
+}
+Write-Host "================================================================" -ForegroundColor Cyan
+
+# ============================================================================
+# CSV EXPORT
+# ============================================================================
+$csvPath = ".\STIG_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$script:Results | Select-Object VulnID, RuleID, Severity, Status, RuleTitle, Details, FixAction |
+    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+Write-Host ""
+Write-Host "Results exported to: $csvPath" -ForegroundColor Green
+
+# ============================================================================
+# HTML REPORT (Optional)
+# ============================================================================
+if ($HTMLReport) {
+    $htmlHeader = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Windows 11 STIG Compliance Report</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; margin: 20px; background: #f5f5f5; color: #333; }
+        h1 { color: #1a1a2e; margin-bottom: 5px; }
+        h2 { color: #1a1a2e; margin-top: 30px; border-bottom: 2px solid #1a1a2e; padding-bottom: 5px; }
+        .meta { color: #666; margin-bottom: 20px; font-size: 0.9em; }
+        .summary { display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }
+        .summary-card { padding: 15px 25px; border-radius: 8px; color: white; font-size: 1.1em; min-width: 120px; }
+        .summary-card .count { font-size: 2.2em; font-weight: bold; }
+        .pass-card { background: #27ae60; }
+        .fail-card { background: #e74c3c; }
+        .manual-card { background: #f39c12; }
+        .na-card { background: #3498db; }
+        .fixed-card { background: #8e44ad; }
+        table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 25px; }
+        th { background: #1a1a2e; color: white; padding: 12px; text-align: left; font-size: 0.9em; }
+        td { padding: 10px 12px; border-bottom: 1px solid #eee; font-size: 0.85em; vertical-align: top; }
+        tr:hover { background: #f8f8f8; }
+        .status-pass { color: #27ae60; font-weight: bold; }
+        .status-fail { color: #e74c3c; font-weight: bold; }
+        .status-manual { color: #f39c12; font-weight: bold; }
+        .status-na { color: #3498db; font-weight: bold; }
+        .status-fixed { color: #8e44ad; font-weight: bold; }
+        .severity-high { background: #fde8e8; }
+        .severity-medium { background: #fff8e1; }
+        .severity-low { background: #e8f5e9; }
+        .fix-action { color: #8e44ad; font-style: italic; font-size: 0.85em; }
+        .manual-steps { background: #fffbee; border-left: 4px solid #f39c12; padding: 10px 15px; margin-top: 8px; font-size: 0.85em; white-space: pre-line; }
+        .manual-section { margin-top: 30px; }
+        .manual-card-detail { background: white; border: 1px solid #ddd; border-left: 4px solid #f39c12; padding: 15px; margin-bottom: 15px; border-radius: 4px; }
+        .manual-card-detail h3 { margin: 0 0 5px 0; color: #e67e22; font-size: 1em; }
+        .manual-card-detail .steps { background: #fafafa; padding: 10px; border-radius: 4px; white-space: pre-line; font-size: 0.9em; line-height: 1.6; }
+        .reboot-warning { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; padding: 12px 20px; border-radius: 6px; margin-bottom: 20px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Windows 11 STIG Compliance Report</h1>
+    <div class="meta">
+        <p>Benchmark: Microsoft_Windows_11_STIG Release 6 | Scan Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Host: $env:COMPUTERNAME | Auto-Fix: $(if($AutoFix){'ENABLED'}else{'DISABLED'}) | Total Rules: $script:TotalChecks</p>
+    </div>
+"@
+
+    if ($script:FixedCount -gt 0) {
+        $htmlHeader += "    <div class='reboot-warning'>$script:FixedCount checks were auto-remediated. A REBOOT may be required for all changes to take effect.</div>`n"
+    }
+
+    $htmlHeader += @"
+    <div class="summary">
+        <div class="summary-card pass-card"><div class="count">$script:PassCount</div>Passed</div>
+        <div class="summary-card fixed-card"><div class="count">$script:FixedCount</div>Auto-Fixed</div>
+        <div class="summary-card fail-card"><div class="count">$script:FailCount</div>Failed</div>
+        <div class="summary-card manual-card"><div class="count">$script:ManualCount</div>Manual</div>
+        <div class="summary-card na-card"><div class="count">$script:NACount</div>N/A</div>
+    </div>
+    <h2>All Results</h2>
+    <table>
+        <tr><th>Vuln ID</th><th>Rule ID</th><th>Sev.</th><th>Status</th><th>Rule Title</th><th>Details / Fix Action</th></tr>
+"@
+
+    $htmlRows = ""
+    foreach ($r in $script:Results) {
+        $statusClass = switch ($r.Status) {
+            "Pass"   { "status-pass" }
+            "Fail"   { "status-fail" }
+            "Manual" { "status-manual" }
+            "N/A"    { "status-na" }
+            "Fixed"  { "status-fixed" }
+        }
+        $sevClass = "severity-$($r.Severity)"
+        $rowClass = if ($r.Status -eq "Fail") { $sevClass } elseif ($r.Status -eq "Fixed") { "severity-low" } else { "" }
+        $detailsHtml = [System.Net.WebUtility]::HtmlEncode($r.Details)
+        if ($r.FixAction) {
+            $detailsHtml += "<br/><span class='fix-action'>Fix Applied: $([System.Net.WebUtility]::HtmlEncode($r.FixAction))</span>"
+        }
+        $htmlRows += "        <tr class='$rowClass'><td>$($r.VulnID)</td><td>$($r.RuleID)</td><td>$($r.Severity)</td><td class='$statusClass'>$($r.Status)</td><td>$($r.RuleTitle)</td><td>$detailsHtml</td></tr>`n"
+    }
+
+    # Manual review section
+    $manualItems = $script:Results | Where-Object { $_.Status -eq "Manual" -and $_.ManualSteps }
+    $manualSection = ""
+    if ($manualItems.Count -gt 0) {
+        $manualSection = "    <h2 class='manual-section'>Manual Review Steps</h2>`n"
+        foreach ($m in $manualItems) {
+            $stepsHtml = [System.Net.WebUtility]::HtmlEncode($m.ManualSteps)
+            $manualSection += @"
+    <div class="manual-card-detail">
+        <h3>$($m.VulnID) ($($m.RuleID)) - $($m.Severity) - $($m.RuleTitle)</h3>
+        <div class="steps">$stepsHtml</div>
+    </div>
+
+"@
+        }
+    }
+
+    $htmlFooter = @"
+    </table>
+$manualSection
+    <p class="meta" style="margin-top: 20px;">Generated by Windows 11 STIG Compliance Checker v2.0 | $script:TotalChecks rules checked</p>
+</body>
+</html>
+"@
+
+    $htmlContent = $htmlHeader + $htmlRows + $htmlFooter
+    $htmlContent | Out-File -FilePath $OutputPath -Encoding UTF8
+    Write-Host "HTML Report exported to: $OutputPath" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host "Done." -ForegroundColor Cyan

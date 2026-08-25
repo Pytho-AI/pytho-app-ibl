@@ -1,0 +1,191 @@
+module.exports = {
+  // Enable dark mode via class
+  darkMode: 'class',
+
+  theme: {
+    extend: {
+      colors: {
+        brand: {
+          50: "var(--color-brand-50)",
+          100: "var(--color-brand-100)",
+          200: "var(--color-brand-200)",
+          300: "var(--color-brand-300)",
+          400: "var(--color-brand-400)",
+          500: "var(--color-brand-500)",
+          600: "var(--color-brand-600)",
+          700: "var(--color-brand-700)",
+          800: "var(--color-brand-800)",
+          900: "var(--color-brand-900)",
+        },
+        neutral: {
+          0: "var(--color-neutral-0)",
+          50: "var(--color-neutral-50)",
+          100: "var(--color-neutral-100)",
+          200: "var(--color-neutral-200)",
+          300: "var(--color-neutral-300)",
+          400: "var(--color-neutral-400)",
+          500: "var(--color-neutral-500)",
+          600: "var(--color-neutral-600)",
+          700: "var(--color-neutral-700)",
+          800: "var(--color-neutral-800)",
+          900: "var(--color-neutral-900)",
+          950: "var(--color-neutral-950)",
+        },
+        error: {
+          50: "var(--color-error-50)",
+          100: "var(--color-error-100)",
+          200: "var(--color-error-200)",
+          300: "var(--color-error-300)",
+          400: "var(--color-error-400)",
+          500: "var(--color-error-500)",
+          600: "var(--color-error-600)",
+          700: "var(--color-error-700)",
+          800: "var(--color-error-800)",
+          900: "var(--color-error-900)",
+        },
+        warning: {
+          50: "var(--color-warning-50)",
+          100: "var(--color-warning-100)",
+          200: "var(--color-warning-200)",
+          300: "var(--color-warning-300)",
+          400: "var(--color-warning-400)",
+          500: "var(--color-warning-500)",
+          600: "var(--color-warning-600)",
+          700: "var(--color-warning-700)",
+          800: "var(--color-warning-800)",
+          900: "var(--color-warning-900)",
+        },
+        success: {
+          50: "var(--color-success-50)",
+          100: "var(--color-success-100)",
+          200: "var(--color-success-200)",
+          300: "var(--color-success-300)",
+          400: "var(--color-success-400)",
+          500: "var(--color-success-500)",
+          600: "var(--color-success-600)",
+          700: "var(--color-success-700)",
+          800: "var(--color-success-800)",
+          900: "var(--color-success-900)",
+        },
+        "brand-primary": "var(--color-brand-primary)",
+        "default-font": "var(--color-default-font)",
+        "subtext-color": "var(--color-subtext)",
+        "neutral-border": "var(--color-neutral-border)",
+        black: "var(--color-black)",
+        "default-background": "var(--color-default-background)",
+      },
+      fontSize: {
+        caption: [
+          "12px",
+          {
+            lineHeight: "16px",
+            fontWeight: "300",
+            letterSpacing: "0em",
+          },
+        ],
+        "caption-bold": [
+          "12px",
+          {
+            lineHeight: "16px",
+            fontWeight: "400",
+            letterSpacing: "0em",
+          },
+        ],
+        body: [
+          "14px",
+          {
+            lineHeight: "20px",
+            fontWeight: "300",
+            letterSpacing: "0em",
+          },
+        ],
+        "body-bold": [
+          "14px",
+          {
+            lineHeight: "20px",
+            fontWeight: "400",
+            letterSpacing: "0em",
+          },
+        ],
+        "heading-3": [
+          "16px",
+          {
+            lineHeight: "20px",
+            fontWeight: "600",
+            letterSpacing: "0em",
+          },
+        ],
+        "heading-2": [
+          "20px",
+          {
+            lineHeight: "24px",
+            fontWeight: "600",
+            letterSpacing: "0em",
+          },
+        ],
+        "heading-1": [
+          "30px",
+          {
+            lineHeight: "36px",
+            fontWeight: "600",
+            letterSpacing: "0em",
+          },
+        ],
+        "monospace-body": [
+          "14px",
+          {
+            lineHeight: "20px",
+            fontWeight: "400",
+            letterSpacing: "0em",
+          },
+        ],
+      },
+      fontFamily: {
+        caption: '"Source Sans 3", system-ui, sans-serif',
+        "caption-bold": '"Source Sans 3", system-ui, sans-serif',
+        body: '"Source Sans 3", system-ui, sans-serif',
+        "body-bold": '"Source Sans 3", system-ui, sans-serif',
+        "heading-3": '"Source Sans 3", system-ui, sans-serif',
+        "heading-2": '"Source Sans 3", system-ui, sans-serif',
+        "heading-1": '"Source Sans 3", system-ui, sans-serif',
+        "monospace-body": "monospace",
+      },
+      boxShadow: {
+        sm: "var(--shadow-sm)",
+        default: "var(--shadow-default)",
+        md: "var(--shadow-md)",
+        lg: "var(--shadow-lg)",
+        overlay: "var(--shadow-overlay)",
+      },
+      borderRadius: {
+        sm: "8px",
+        md: "16px",
+        DEFAULT: "16px",
+        lg: "24px",
+        full: "9999px",
+      },
+      container: {
+        padding: {
+          DEFAULT: "16px",
+          sm: "calc((100vw + 16px - 640px) / 2)",
+          md: "calc((100vw + 16px - 768px) / 2)",
+          lg: "calc((100vw + 16px - 1024px) / 2)",
+          xl: "calc((100vw + 16px - 1280px) / 2)",
+          "2xl": "calc((100vw + 16px - 1536px) / 2)",
+        },
+      },
+      spacing: {
+        112: "28rem",
+        144: "36rem",
+        192: "48rem",
+        256: "64rem",
+        320: "80rem",
+      },
+      screens: {
+        mobile: {
+          max: "767px",
+        },
+      },
+    },
+  },
+};

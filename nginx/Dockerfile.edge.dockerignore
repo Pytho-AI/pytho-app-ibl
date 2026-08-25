@@ -1,0 +1,27 @@
+# Build context is the repo root (see docker-compose.yml -
+# `context: .`, `dockerfile: nginx/Dockerfile.edge`). Paths below are
+# relative to the repo root.
+#
+# ui/node_modules IS shipped into the build context on the airgapped
+# spark target — the Alpine build container skips `yarn install` when
+# it finds a platform-matching node_modules present. To force clean
+# install on an internet-connected dev host, delete ui/node_modules
+# before running the build.
+#
+# yarn.lock stays ignored — regenerated from package.json on the dev
+# host's `yarn install` and committed there.
+
+# Ignore host-side build artifacts + non-nginx-relevant top-level dirs.
+ui/yarn.lock
+ui/dist
+ui/dist-*
+
+# Backend + agent trees not needed for the nginx image build.
+app
+agent
+ai
+data
+data-vcorps
+logs*
+manual_injects*
+scratch

@@ -1,0 +1,67 @@
+virtual-app
+/ui/node_modules
+/ui/yarn.lock
+.DS_Store
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+**/*.env
+app/.env.local
+pytho.db
+/static
+ui/dist/
+.DS_Store
+.DS_Store
+uploads/
+virtual/
+node_modules*.db
+app/.aws_credentials
+.aws_credentials
+es-data/
+*.lock
+/models/
+/data/models/
+.vscode/*
+/data/es-data/
+
+# Ignore .gitkeep so they don't show in changes
+*.gitkeep
+**/.gitkeep
+
+# Ignore model files (downloaded/generated)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.onnx
+**/models/
+.claude/settings.json
+
+# Test output
+test_output/
+test_pdf_conversion.py
+test_docgen_local.py
+test_docgen.py
+data/pytho.db-shm
+data/pytho.db-wal
+
+# TypeScript incremental build cache — per-developer machine state, never commit.
+# `**/*.env` above already covers ui/.env in principle, but the file was tracked
+# in a prior commit; the `git rm --cached` accompanying this rule unsticks it.
+*.tsbuildinfo
+ui/nginx/ssl/key.pem
+data
+
+# IRC service ephemeral state — chat history + Ergo's WAL files. Per-host
+# runtime data, never commit.
+ergo/*.db
+ergo/*.db-shm
+ergo/*.db-wal
+
+# Repo-local scratch is BANNED. Design docs / running logs / venvs /
+# audit reports go to the parent-of-repo `scratch/` dir
+# (../scratch/docs/ibl/ for IBL work on the mac side, ~/scratch/
+# on spark). Pinning this here so a future `git add` can't accidentally
+# sweep a scratch/ tree into the repo.
+scratch/

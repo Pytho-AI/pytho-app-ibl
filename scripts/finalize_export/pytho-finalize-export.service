@@ -1,0 +1,26 @@
+[Unit]
+Description=Pytho finalize → TrueNAS share export
+Documentation=https://github.com/Pytho-AI/pytho-app/blob/ibl/scripts/finalize_export/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pytho
+
+# Fill in the actual mount path before enabling on the SCIF host.
+Environment=PYTHO_FINALIZE_EXPORT_DIR=
+
+# Optional override — defaults to $HOME/pytho-app/uploads/_autodraft if unset.
+# Environment=PYTHO_FINALIZE_WATCH_DIR=/home/pytho/pytho-app/uploads/_autodraft
+
+ExecStart=/home/pytho/pytho-app/scripts/finalize_export/finalize_to_truenas.sh
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

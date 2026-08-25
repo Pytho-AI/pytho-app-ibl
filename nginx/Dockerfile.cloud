@@ -1,0 +1,23 @@
+# Cloud nginx image — BOTH cloud boxes (production internalapi +
+# staging stagingapi run the identical image; per-box certs are volume
+# mounts, server_name is a catch-all in the conf).
+#
+# No frontend build — the pytho-vite SPA is deployed separately via SST;
+# this host serves only the reverse-proxy surface (plus geo-agent's
+# /geo-app frontend, which geo-agent itself serves through the proxy).
+# Compose invocation (context scoped to ./nginx/, unlike Dockerfile.edge
+# which needs the repo root for the SPA build):
+#
+#   build:
+#       context: ./nginx/
+#       dockerfile: Dockerfile.cloud
+FROM nginx:alpine
+
+# Replace nginx's default server config with the cloud conf.
+RUN rm /etc/nginx/conf.d/default.conf
+COPY nginx.cloud.conf /etc/nginx/conf.d/nginx.conf
+
+# Expose HTTP and HTTPS ports
+EXPOSE 80 443
+
+CMD ["nginx", "-g", "daemon off;"]

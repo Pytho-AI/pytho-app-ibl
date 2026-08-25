@@ -1,0 +1,637 @@
+volumes:
+    es-config:
+
+networks:
+    pytho-net:
+        name: pytho-net
+        external: true
+
+services:
+    docker-api:
+        container_name: docker-api
+        user: "1000:1000"
+        # `docker-api-primary` alias disambiguates from
+        # `docker-api-vcorps` — both compose projects put a `docker-api`
+        # alias on the same pytho-net (V Corps + primary), Docker DNS
+        # non-deterministically picks one. Any cross-service caller that
+        # needs THIS instance (e.g. geo-agent's /api/v1/render delegating
+        # back for the render lift) should target `docker-api-primary`.
+        networks:
+            pytho-net:
+                aliases: [docker-api, docker-api-primary]
+        env_file:
+            - app/.env
+        environment:
+            # Stamped on every job entry in the in-memory _JOBS registry and
+            # on every event the parallel-DAG publisher emits. DESIGN §12
+            # contract #5 — future jobs-table orphan sweep queries against
+            # this value.
+            CONTAINER_ID: docker-api-1
+            # Host-side Chromium via CDP for headless rendering. The host
+            # runs a long-lived Playwright/Chromium with GPU acceleration
+            # (e.g. spark-dev's chromium-cdp.service systemd unit);
+            # docker-api connect_over_cdp to it. This is the ARCHITECTURE
+            # — the docker-api container itself does NOT render anything,
+            # does NOT need a GPU, and does NOT need /dev/dri. Containerized
+            # Chromium was investigated for 12 hours on the GB10 and
+            # rejected (no GPU access through --runtime=nvidia /
+            # --privileged / --device=/dev/dri on that hardware), and the
+            # in-container fallback path also hit the WebKit-Native ARM64
+            # GeoJSON-tile-worker bug that left mil-sym + EA fills + OBJ
+            # kidneys missing. Host-Chrome via CDP is the only path.
+            # See utils/render/headless.py:_get_warm_browser.
+            # Same-machine topology: docker-api, proxy-app, vllm, and
+            # chromium-cdp.service all run on the spark host. docker-api
+            # reaches the host's published ports via the docker bridge
+            # gateway (172.17.0.1 in this docker install — that IS the
+            # spark host as seen from inside docker-api). Chromium's
+            # CDP socket binds on the host at 9222.
+            #
+            # Once CDP is connected, every render's page.goto target is
+            # PYTHO_RENDER_HOST_BASE — also the spark host, but reached
+            # via the host loopback because Chromium runs ON the host.
+            # Self-signed internal-CA cert; render context passes
+            # ignore_https_errors so the cert isn't validated.
+            PYTHO_RENDER_CDP: "http://172.17.0.1:9222"
+            PYTHO_RENDER_HOST_BASE: "https://localhost"
+            # Feature flag: when set, tool_render_map POSTs to geo-agent's
+            # /api/v1/render instead of driving Playwright locally. Empty
+            # or unset → local Playwright driver (legacy). See
+            # scratch/docs/map-api/unification-plan.md Task 6.
+            # geo-agent is a STANDALONE service — reached over its host-
+            # published port (9845), never a shared docker network. Same
+            # pattern as vllm at host.docker.internal:18000. GEO_API_URL is
+            # the ONE knob; /api/v1 and /api/v1/render derive from it.
+            GEO_API_URL: "http://host.docker.internal:9845"
+            # Restart auto-retry escape hatch. When this is set, the
+            # JobEvent-replay path SKIPS the "synthesize-failed +
+            # re-dispatch every stranded running/server_restart chain"
+            # loop. Audit log still gets the terminal transition; the
+            # chain just isn't re-fired. Use this during demo prep /
+            # debug-time when a backlog of failed chains would otherwise
+            # stack into a thundering herd every time docker-api
+            # restarts. Operator manually fires what they actually want
+            # via /api/products/records/{id}/retry or
+            # /api/diag/product_autodraft/refire. Unset / "0" to revert
+            # to the default V4 auto-retry behavior.
+            PYTHO_DISABLE_RESTART_AUTO_RETRY: "1"
+            # ── Live Office editor (WOPI) configuration ────────────────────
+            # COLLABORA_NARRATIVE_EDIT gates whether DOCX / PPTX artifacts
+            # open in the Collabora iframe (LiveEditor) or fall back to the
+            # legacy TinyMCE DocEditor. XLSX is always LiveEditor. Default
+            # on — LiveEditor is the canonical co-edit surface (cooperative
+            # WS sessions, in-place map swap via UNO, single source of
+            # truth for the deliverable bytes). TinyMCE is the legacy
+            # path; explicitly opt back in (COLLABORA_NARRATIVE_EDIT=false)
+            # only if Collabora is down and the analyst needs a fallback.
+            COLLABORA_NARRATIVE_EDIT: "${COLLABORA_NARRATIVE_EDIT:-true}"
+            # Stable JWT secret for WOPI tokens. Without this, the secret
+            # rotates on every container restart → every minted token
+            # (every open editor session) breaks on restart. Set in the
+            # spark-dev .env to a stable random value; falls back to
+            # /app/data/wopi_secret (file-persisted) when unset.
+            WOPI_SECRET: "${WOPI_SECRET:-}"
+            # 7-day TTL so analysts who leave a doc open over the weekend
+            # don't get a fresh "open the editor" round-trip Monday
+            # morning. IBL is internal-network unclassified; long TTL is
+            # acceptable in this threat model.
+            WOPI_TOKEN_TTL_SEC: "604800"
+            # ── Local-model service routing (Docker DNS) ─────────────────
+            # ollama serves the embedding model (utils/embedding.py).
+            # kokoro-tts serves the TTS API (utils/generate_audio.py).
+            # Both reachable via Docker DNS on pytho-net; service-to-
+            # service should NEVER round-trip through host.docker.internal
+            # per the routing-pattern memory rule.
+            PYTHONDONTWRITEBYTECODE: "1"
+            OLLAMA_HOST: "ollama:11434"
+            TTS_HOST: "kokoro-tts"
+            TTS_PORT: "8880"
+        volumes:
+            - ${PYTHO_DATA:-./data}/models:/app/models
+            - ${PYTHO_DATA:-./data}/data:/app/data
+            - ${PYTHO_DATA:-./data}/uploads:/app/uploads
+            - ${PYTHO_DATA:-./data}/resources:/app/resources
+            # Persistent diagnostic logs that survive container rebuild —
+            # klieglight_autofire writes per-poll gate-rejection counters
+            # to /app/logs/klieglight_autofire.log so SCIF poll data can
+            # be inspected after the spark is brought back (docker logs
+            # are wiped on container recreate). RotatingFileHandler at
+            # 50MB × 5 keeps disk bounded.
+            - ./logs:/app/logs
+            # Manual injects — analyst-swappable PROJECT_DOCS source. Point
+            # MANUAL_INJECTS_DIR (default /app/manual_injects) at this mount;
+            # the watcher in utils.manual_injects polls every 30s for mtime
+            # changes and merges any *.docx into PROJECT_DOCS. For event-day
+            # the host path can be a symlink to an SMB share.
+            - ${PYTHO_MANUAL_INJECTS:-./manual_injects}:/app/manual_injects:ro
+        build:
+            context: .
+            dockerfile: ./app/Dockerfile
+        ports:
+            - "127.0.0.1:8000:8000"
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "5m"
+                max-file: "5"
+        restart: always
+        security_opt:
+            - no-new-privileges:true
+        tmpfs:
+            - /tmp
+            - /app/transcripts
+        deploy:
+            resources:
+                limits:
+                    memory: 4G
+                    cpus: "2.0"
+                    # Walks burn pids fast: Cougaar GQL singleton (1 thread + N
+                    # subprocesses), 30s recent-intel poll loop, WS pool, bg
+                    # ThreadPoolExecutor (8) for html_to_docx, headless
+                    # playwright/Chromium forks for preview rendering, FastAPI
+                    # worker pool. 200 saturates around walk product ~30; 800
+                    # leaves headroom for sustained parallel walks.
+                    pids: 800
+
+    # =============================================================
+    # Scenario-frozen NTP server — UDP/123 wire-protocol responder
+    # serving the frozen scenario clock to non-Python consumers
+    # NOTE: Chromium for the headless map render does NOT live in
+    # docker. It's a HOST systemd unit (chromium-cdp.service) — the
+    # GB10 GPU is reachable only from host-side Chromium with
+    # `--use-gl=angle --use-angle=gl-egl`. Containerized Chromium
+    # was investigated for 12 hours and rejected: no GPU on GB10
+    # even with --runtime=nvidia / --privileged / --device=/dev/dri.
+    # docker-api reaches the host-side endpoint at
+    # http://172.17.0.1:9222 (docker bridge -> host).
+
+    # (geo-agent, OS chronyd on analyst laptops, anything that
+    # speaks NTP). Pulls the frozen time from docker-api's
+    # /api/scenario-clock endpoint on a 5s refresh.
+    # =============================================================
+    scenario-ntp:
+        image: python:3.11-slim
+        container_name: scenario-ntp
+        depends_on:
+            - docker-api
+        networks: [pytho-net]
+        environment:
+            SCENARIO_CLOCK_URL: http://docker-api:8000/api/scenario-clock
+            NTP_BIND_PORT: "123"
+        volumes:
+            - ./scripts/scenario_ntp_server.py:/scenario_ntp_server.py:ro
+        ports:
+            # Bind on the host so analyst laptops can `ntpdate localhost`
+            # or chronyd-sync against this scenario clock.
+            - "0.0.0.0:123:123/udp"
+        cap_add:
+            - NET_BIND_SERVICE
+        command: ["python3", "/scenario_ntp_server.py"]
+        restart: unless-stopped
+        healthcheck:
+            # Probe ourselves with a minimal NTP packet via Python.
+            test: ["CMD-SHELL", "python3 -c \"import socket,struct; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'\\x1b'+b'\\x00'*47,('127.0.0.1',123)); d,_=s.recvfrom(48); assert len(d)==48\" || exit 1"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 10s
+
+    # =============================================================
+    # Live Document Editor (Collabora) — also used by docker-api as
+    # the DOCX/PPTX renderer: docker-api POSTs the artifact to
+    # http://editor:9980/cool/convert-to/pdf and rasterizes the PDF
+    # pages via PyMuPDF into preview images. Lifted verbatim from
+    # ai/agent/docker-compose.yml so the eventual editor swap drops
+    # the same container into the analyst surface.
+    # =============================================================
+    editor:
+        image: collabora/code@sha256:cfbf62dbed7f3a2bebeb634235c606613813a1857f85111da3a97db316029bba
+        container_name: agent-editor
+        networks: [pytho-net]
+        # WOPI fetches for V Corps documents go to the V Corps docker-api's
+        # host-published port (aliasgroup2) — needs host-gateway resolution.
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        user: root
+        ports:
+            # 0.0.0.0 — the editor is shared infrastructure like geo-agent:
+            # the V Corps stack (and any future stack) reaches it over the
+            # host-published port via host.docker.internal, NOT via a shared
+            # docker network. Closed demo network; nginx still fronts all
+            # analyst-facing traffic.
+            - "9980:9980"
+        environment:
+            # ssl.termination=true tells coolwsd "TLS is terminated by
+            # an upstream proxy" so it builds wss:// URLs for the
+            # browser-side WebSocket when the parent page is loaded over
+            # HTTPS. nginx honors inbound X-Forwarded-Proto (see
+            # ui/nginx/nginx-main.conf $real_scheme map), so coolwsd
+            # sees the correct scheme per-request — works for both
+            # plain-HTTP (Tailscale direct) and HTTPS (AWS reverse proxy
+            # OR nginx terminating TLS on :443 with self-signed cert) paths.
+            - extra_params=--o:ssl.enable=false --o:ssl.termination=true --o:welcome.enable=false --o:home_mode.enable=false --o:net.frame_ancestors=* --o:net.allowed_websocket_origins.origin[0]=.* --o:net.allowed_websocket_origins.origin[1]=http://10.0.1.30 --o:net.allowed_websocket_origins.origin[2]=https://10.0.1.30 --o:net.allowed_websocket_origins.origin[3]=http://10.0.1.30:10443 --o:net.allowed_websocket_origins.origin[4]=https://10.0.1.30:10443
+            # Multi-stack WOPI hostname allowlist. IDX 26 sends WOPISrc URLs
+            # naming `docker-api:8000`; V Corps sends `docker-api-vcorps:8000`.
+            # This is a SINGLE editor container serving BOTH stacks — the
+            # `-vcorps` parallel editor was tornDown as unnecessary
+            # duplication (the editor is stateless; document identity is the
+            # WOPI URL, not the container). Each aliasgroup entry is a
+            # separate WOPI host the editor accepts and proxies WOPI
+            # protocol requests back to. Both docker-api and
+            # docker-api-vcorps are resolvable via Docker DNS on pytho-net
+            # so the editor's HTTP calls (WOPI CheckFileInfo / GetFile /
+            # PutFile / the map-refresh /files fetch) reach the correct
+            # stack's uploads tree.
+            - aliasgroup1=http://docker-api:8000
+            # V Corps docker-api — reached over its host-published port
+            # (the V Corps stack no longer joins this stack's docker
+            # network). Requires the extra_hosts host-gateway entry below.
+            - aliasgroup2=http://host.docker.internal:18008
+        volumes:
+            - ./editor/patch-editor.sh:/patch-editor.sh:ro
+            - ./editor/military_macro:/military_macro:ro
+            - ./editor/pytho-logo.svg:/pytho-logo.svg:ro
+            - ./editor/editor-icons:/editor-icons:ro
+            - ./editor/images_sukapura_svg.zip:/images_sukapura_svg.zip:ro
+            # Custom Python scripts the LiveEditor frontend invokes via
+            # PostMessage CallPythonScript. patch-editor.sh copies these into
+            # /opt/collaboraoffice/share/Scripts/python/ at boot so the
+            # script's `vnd.sun.star.script` URL resolves. See editor/scripts/
+            # README + the pytho_graphics.py docstring.
+            - ./editor/scripts:/pytho-scripts:ro
+            # Offline-installable Collabora debs for the Python script provider
+            # + pyuno bridge. patch-editor.sh `dpkg -i`s these at boot when
+            # the packages aren't already on the image. REQUIRED for the
+            # air-gapped spark — apt-get can't reach a repo there, so without
+            # this mount every CallPythonScript dispatch fails and the
+            # Done-editing UNO swap collapses to a 15-45s iframe reload.
+            - ./editor/debs:/pytho-debs:ro
+            # Read-only view of docker-api's uploads dir. Same source
+            # path the API writes to (${PYTHO_DATA}/uploads). The editor
+            # needs this so pytho_graphics.replace_picture can load a
+            # freshly-re-rendered map JPEG from disk and swap it into
+            # the OPEN document in-place via UNO. Without this mount,
+            # the Done-editing flow has to force a full Collabora
+            # iframe reload (15-45s parse-from-scratch) to pick up the
+            # new bytes; with it, the UNO swap repaints just the
+            # picture shape and the analyst stays on their slide.
+            - ${PYTHO_DATA:-./data}/uploads:/uploads:ro
+        entrypoint: ["/bin/sh", "/patch-editor.sh"]
+        # MKNOD only. SYS_ADMIN was tried (it removes the boot
+        # `CLONE_NEWUSER unshare failed (EPERM)` line and the
+        # testMountingNSInFork probe passes), but the subsequent
+        # `mount(MS_BIND, ...)` syscall still fails — docker's
+        # overlayfs storage driver does not allow nested bind-mounts
+        # regardless of caps. linkOrCopy stays as the jail-population
+        # path. Measured cost in the editor logs is ~200 ms per kit
+        # fork, NOT the multi-second tax that was assumed.
+        cap_add:
+            - MKNOD
+        healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost:9980/hosting/discovery || exit 1"]
+            interval: 15s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+        restart: unless-stopped
+
+    # ─────────────────────────────────────────────────────────────────
+    # Ergo — IRCv3 daemon (single Go binary, ~10-30 MB RAM) used as the
+    # shared analyst-chat backend for the LiveEditor. One channel per
+    # artifact (#doc-<artifact_id>); nick is the email-prefix; scrollback
+    # is persisted in Ergo's built-in BoltDB so the analyst sees prior
+    # conversation on re-join. Frontend speaks IRC-over-WebSocket
+    # directly through the nginx /chat/socket proxy below; we do NOT
+    # bundle a web client (gamja) — the pytho-vite SPA is the UI.
+    #
+    # Air-gap: no federation (Ergo doesn't support s2s — intentional
+    # upstream choice), no telemetry, vendored Go deps. Loopback-only
+    # port binding; only nginx reaches it.
+    # ─────────────────────────────────────────────────────────────────
+    ergo:
+        image: ghcr.io/ergochat/ergo:stable
+        container_name: agent-chat
+        networks: [pytho-net]
+        init: true
+        restart: unless-stopped
+        volumes:
+            - ./ergo/ircd.yaml:/ircd/ircd.yaml:ro
+            - ${PYTHO_DATA:-./data}/ergo:/ircd-data
+        ports:
+            # WebSocket listener — TLS terminates at nginx.
+            - "127.0.0.1:8097:8097"
+        healthcheck:
+            test: ["CMD-SHELL", "wget -qO- --tries=1 --timeout=2 http://127.0.0.1:8097/ 2>/dev/null | grep -qi '^upgrade' || nc -z 127.0.0.1 8097"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 15s
+
+    nginx:
+        depends_on:
+            - docker-api
+        container_name: proxy-app
+        networks: [pytho-net]
+        # The geo_agent upstream targets the standalone geo-agent service
+        # at host.docker.internal:9845 (see nginx/nginx.edge.conf).
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        build:
+            # Build context is repo root so the multi-stage nginx
+            # Dockerfile can COPY both nginx/ (confs + certs) and ui/
+            # (SPA source) into the image. Same layout as prod:
+            # nginx/Dockerfile.<env> + nginx/nginx.<env>.conf.
+            context: .
+            dockerfile: nginx/Dockerfile.edge
+            args:
+                # VITE_OFFLINE_MODE was removed 2026-07-01 — the frontend
+                # now always fetches tiles from the local tileserver via
+                # the nginx /tiles proxy. Tile provenance is a backend
+                # concern: which mbtiles are loaded, whether the
+                # tileserver proxies external services. If a deployment
+                # needs external tile sources, add them at the tileserver
+                # config, not via a frontend build flag.
+                # Frontend calls hit /geo-api/v1/* which nginx rewrites to
+                # /api/v1/* before proxying to the standalone geo-agent at
+                # host.docker.internal:9845. Tiles ride the same path —
+                # geo-agent serves + caches them internally.
+                VITE_GEO_AGENT_API_URL: ${VITE_GEO_AGENT_API_URL:-/geo-api/v1}
+                VITE_COA_WS_URL: ${VITE_COA_WS_URL:-}
+                VITE_COA_API_URL: ${VITE_COA_API_URL:-}
+                VITE_SHOW_APP_RAIL: ${VITE_SHOW_APP_RAIL:-false}
+        ports:
+            - "0.0.0.0:80:80"
+            - "0.0.0.0:443:443"
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "1k"
+                max-file: "3"
+        restart: always
+        security_opt:
+            - no-new-privileges:true
+        volumes:
+            # Edge conf. `nginx.edge.conf` matches the naming convention
+            # cloud uses (nginx.staging.conf, nginx.cloud.conf) — one
+            # conf per deployment target, no env-var templating. The
+            # vcorps override at ./ui/nginx/nginx-vcorps.conf is a
+            # tenant-specific stopgap that goes away once the parallel-
+            # stack pattern is folded into the shared services model.
+            - ./nginx/nginx.edge.conf:/etc/nginx/conf.d/nginx.conf:ro
+            - ./nginx/nginx-main.conf:/etc/nginx/nginx.conf:ro
+            # Bind-mount the pre-built dist/ over the image's baked-in
+            # /usr/share/nginx/html. The IBL spark-dev is airgapped (no DNS,
+            # no internet) and cannot run `yarn install` during a fresh image
+            # build, so the Dockerfile's build stage is unusable post-airgap.
+            # The host filesystem holds the freshly-built artifacts (rsynced
+            # from the dev mac after `yarn build`), and this mount makes them
+            # the served root without requiring a rebuild. ui/dist is
+            # gitignored, so artifacts are NOT distributed via git pull; they
+            # are shipped out-of-band (tarball + scp) when the source changes.
+            - ./ui/dist:/usr/share/nginx/html:ro
+        read_only: true
+        tmpfs:
+            - /tmp
+            - /var/cache/nginx:uid=101,gid=101
+            - /var/run:uid=101,gid=101
+        deploy:
+            resources:
+                limits:
+                    memory: 512M
+                    cpus: "1.0"
+                    pids: 100
+
+    # Elasticsearch
+    es-secure:
+        image: docker.elastic.co/elasticsearch/elasticsearch:9.1.4
+        container_name: es-secure
+        networks: [pytho-net]
+        environment:
+            - discovery.type=single-node
+            - xpack.security.enabled=true
+            - xpack.security.http.ssl.enabled=false
+            - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme}
+            - ES_JAVA_OPTS=-Xms512m -Xmx512m
+        volumes:
+            - ${PYTHO_DATA:-./data}/es-data:/usr/share/elasticsearch/data
+            - es-config:/usr/share/elasticsearch/config
+        ports:
+            - "127.0.0.1:9200:9200"
+            - "127.0.0.1:9300:9300"
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "5"
+        restart: always
+        security_opt:
+            - no-new-privileges:true
+        read_only: true
+        tmpfs:
+            - /tmp
+            - /usr/share/elasticsearch/logs
+        healthcheck:
+            test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+            interval: 30s
+            timeout: 5s
+            start_period: 30s
+            retries: 3
+        deploy:
+            resources:
+                limits:
+                    memory: 1G
+                    cpus: "2.0"
+                    pids: 300
+
+    # GPU version (used when NVIDIA GPU is available)
+    stability-api-gpu:
+        image: ghcr.io/ai-dock/stable-diffusion-webui:latest-cuda
+        container_name: stability_api_gpu
+        networks:
+            pytho-net:
+                aliases: [stability_api]
+        profiles: ["gpu"]
+        ports:
+            - "127.0.0.1:7860:17860"
+        environment:
+            - HF_TOKEN=<REDACTED>
+            - WEBUI_ARGS=--api --listen --disable-console-progressbars --disable-safe-unpickle
+        volumes:
+            - ${PYTHO_DATA:-./data}/sd-models:/opt/stable-diffusion-webui/models
+            - ${PYTHO_DATA:-./data}/sd-outputs:/opt/stable-diffusion-webui/outputs
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "5"
+        restart: always
+        security_opt:
+            - no-new-privileges:true
+        healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost:17860/ || exit 1"]
+            interval: 60s
+            timeout: 10s
+            start_period: 120s
+            retries: 3
+        deploy:
+            resources:
+                limits:
+                    memory: 64G
+                    cpus: "8.0"
+                    pids: 300
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: all
+                          capabilities: [gpu]
+
+    # CPU version (fallback when no GPU available)
+    stability-api-cpu:
+        image: ghcr.io/ai-dock/stable-diffusion-webui:latest-cpu
+        container_name: stability_api_cpu
+        networks:
+            pytho-net:
+                aliases: [stability_api]
+        profiles: ["cpu"]
+        ports:
+            - "127.0.0.1:7860:17860"
+        environment:
+            - HF_TOKEN=<REDACTED>
+            - WEBUI_ARGS=--api --listen --disable-console-progressbars --disable-safe-unpickle --skip-torch-cuda-test
+        volumes:
+            - ${PYTHO_DATA:-./data}/sd-models:/opt/stable-diffusion-webui/models
+            - ${PYTHO_DATA:-./data}/sd-outputs:/opt/stable-diffusion-webui/outputs
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "5"
+        restart: always
+        security_opt:
+            - no-new-privileges:true
+        healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost:17860/ || exit 1"]
+            interval: 60s
+            timeout: 10s
+            start_period: 120s
+            retries: 3
+        deploy:
+            resources:
+                limits:
+                    memory: 64G
+                    cpus: "8.0"
+                    pids: 300
+
+    # Kokoro TTS - Text-to-Speech service. Boots by default; docker-api
+    # reaches it via Docker DNS at kokoro-tts:8880 (TTS_HOST env in
+    # docker-api). The `tts` profile is gone — every analyst-facing
+    # audio narration path needs TTS up, so it joins the default startup
+    # set per the air-gapped-must-boot-clean rule.
+    kokoro-tts:
+        image: ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.4
+        container_name: kokoro_tts
+        networks: [pytho-net]
+        ports:
+            - "127.0.0.1:8880:8880"
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "5m"
+                max-file: "5"
+        restart: always
+        security_opt:
+            - no-new-privileges:true
+        healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost:8880/ || exit 1"]
+            interval: 30s
+            timeout: 5s
+            start_period: 30s
+            retries: 3
+        deploy:
+            resources:
+                limits:
+                    memory: 2G
+                    cpus: "2.0"
+                    pids: 200
+
+    # ─────────────────────────────────────────────────────────────────
+    # Ollama — embedding server.
+    #
+    # Serves `embeddinggemma:300m` (Google EmbeddingGemma 300M) on
+    # :11434. docker-api hits it via Docker DNS at ollama:11434 (the
+    # OLLAMA_HOST env on docker-api). Doctrine corpus indexing (kNN over
+    # the `doctrine_chunks` ES index) and chat-time retrieval embeddings
+    # both flow through utils/embedding.py -> this service.
+    #
+    # The model is pulled once on first boot via the ollama-init
+    # sidecar below; subsequent restarts use the cached weights on the
+    # ./data/ollama volume so boot is instant.
+    #
+    # GPU is reserved because EmbeddingGemma forward passes are ~3-5×
+    # faster on the Blackwell GPU than on the Arm CPU. The GB10 unified
+    # LPDDR5X allocator handles ollama + vllm co-residency — small
+    # footprint (~1 GB resident when loaded), well under the headroom
+    # vllm leaves at gpu_memory_utilization=0.7.
+    # ─────────────────────────────────────────────────────────────────
+    ollama:
+        image: ollama/ollama:latest
+        container_name: ollama
+        networks: [pytho-net]
+        volumes:
+            - ${PYTHO_DATA:-./data}/ollama:/root/.ollama
+        environment:
+            # Bind on all interfaces inside the container so the init
+            # sidecar AND docker-api can both reach it via Docker DNS.
+            - OLLAMA_HOST=0.0.0.0:11434
+            # Keep the model resident across requests; default 5min
+            # causes a ~2s cold-load every doctrine-chat query.
+            - OLLAMA_KEEP_ALIVE=24h
+        ports:
+            # Host port for diagnostic curl from spark-dev. Service-to-
+            # service goes through Docker DNS, not this binding.
+            - "127.0.0.1:11434:11434"
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: all
+                          capabilities: [gpu]
+        healthcheck:
+            test: ["CMD", "ollama", "list"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 90s
+        restart: unless-stopped
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "5m"
+                max-file: "3"
+
+    # One-shot model puller. Runs once after the ollama server is
+    # healthy and pulls embeddinggemma:300m onto the persistent volume.
+    # Exits 0 when the model is present; restart: "no" so it doesn't
+    # loop. On a re-deploy where the model is already cached, the pull
+    # is a no-op (~200 ms).
+    ollama-init:
+        image: ollama/ollama:latest
+        container_name: ollama-init
+        networks: [pytho-net]
+        depends_on:
+            ollama:
+                condition: service_healthy
+        environment:
+            - OLLAMA_HOST=ollama:11434
+        entrypoint: ["/bin/sh", "-c"]
+        command:
+            - "ollama pull embeddinggemma:300m && echo 'ollama-init: embeddinggemma:300m ready'"
+        restart: "no"
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "1m"
+                max-file: "2"

@@ -1,0 +1,91 @@
+# Cloud compose — ONE file for BOTH cloud boxes (production internalapi
+# + staging stagingapi). The boxes differ only in DNS and the certs
+# mounted from ../certs; everything here is identical. Replaces the old
+# main-branch docker-compose-cloud.yml/docker-compose-staging.yml pair,
+# which differed only in whitespace and the Dockerfile/conf names.
+#
+# geo-agent is NOT part of this compose and shares NO network with it —
+# it runs as its own standalone stack on the box (its compose publishes
+# host port 9845) and both docker-api and nginx reach it via
+# host.docker.internal:9845 (extra_hosts host-gateway below). Do not
+# re-add a geo-agent network here; that pre-unification coupling (plus
+# the generic `backend` DNS alias it relied on) is exactly what the map
+# unification removed.
+services:
+    docker-api:
+        container_name: docker-api
+        # Run as root like the edge stack runs with an explicit user
+        # override. The image's default USER appuser (999) cannot mkdir
+        # under the root-owned /app WORKDIR (boot writes transcripts/,
+        # logs/) and cannot write bind mounts created root-owned on the
+        # host — staging docker-api crash-looped on
+        # 'sqlite3 attempt to write a readonly database' then
+        # 'PermissionError: transcripts' (2026-07-06).
+        user: root
+        env_file:
+            - app/.env
+            - app/.aws_credentials
+        environment:
+            # THE one geo-agent knob: base URL of the standalone map
+            # service on this box; /api/v1 and /api/v1/render derive.
+            GEO_API_URL: "http://host.docker.internal:9845"
+        volumes:
+            - ./models:/app/models
+            - ./data:/app/data
+            - ./uploads:/app/uploads
+            - ./resources:/app/resources
+        build:
+            context: .
+            dockerfile: ./app/Dockerfile
+        expose:
+            - "8000"
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        networks:
+            - default
+            - coa-engine-network
+            - agent-network
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "5m"
+                max-file: "5"
+        restart: always
+
+    nginx:
+        depends_on:
+            - docker-api
+        container_name: proxy-app
+        build:
+            context: ./nginx/
+            dockerfile: Dockerfile.cloud
+        ports:
+            - "80:80"
+            - "443:443"
+        volumes:
+            # Per-box Let's Encrypt certs from the EC2 instance
+            - ../certs:/etc/nginx/certs:ro
+            # Webroot for Let's Encrypt challenges
+            - ../webroot:/var/www/html
+        extra_hosts:
+            # nginx's geo_agent upstream targets host.docker.internal:9845
+            - "host.docker.internal:host-gateway"
+        networks:
+            - default
+            - coa-engine-network
+            - agent-network
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "1k"
+                max-file: "3"
+        restart: always
+
+networks:
+    default:
+    coa-engine-network:
+        external: true
+        name: coa-engine_default
+    agent-network:
+        external: true
+        name: agent_default
